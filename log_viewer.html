@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wi-Fi 監視ログビューア</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+JP:wght@400;500;600&display=swap');
+
+  :root {
+    --bg:       #0d1117;
+    --surface:  #161b22;
+    --border:   #21262d;
+    --accent:   #58a6ff;
+    --green:    #3fb950;
+    --red:      #f85149;
+    --yellow:   #d29922;
+    --text:     #c9d1d9;
+    --muted:    #6e7681;
+    --mono:     'IBM Plex Mono', monospace;
+    --sans:     'IBM Plex Sans JP', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+  }
+
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 32px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  header h1 {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    color: var(--accent);
+  }
+
+  .badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-weight: 600;
+  }
+  .badge-green  { background: #1a3a20; color: var(--green); }
+  .badge-red    { background: #3a1a1a; color: var(--red); }
+  .badge-yellow { background: #3a2e10; color: var(--yellow); }
+  .badge-blue   { background: #1a2a3a; color: var(--accent); }
+
+  .container { max-width: 1000px; margin: 0 auto; padding: 32px 24px; }
+
+  /* File drop zone */
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 48px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .2s, background .2s;
+    margin-bottom: 32px;
+  }
+  .dropzone:hover, .dropzone.drag { border-color: var(--accent); background: #0d1f33; }
+  .dropzone .icon { font-size: 48px; margin-bottom: 12px; }
+  .dropzone p { color: var(--muted); font-size: 14px; line-height: 1.8; }
+  .dropzone strong { color: var(--text); }
+  #fileInput { display: none; }
+
+  /* Stats bar */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
+  .stat-card .value { font-family: var(--mono); font-size: 28px; font-weight: 600; line-height: 1; }
+  .stat-card .value.red    { color: var(--red); }
+  .stat-card .value.green  { color: var(--green); }
+  .stat-card .value.yellow { color: var(--yellow); }
+
+  /* Filter bar */
+  .filter-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .filter-btn {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all .15s;
+    font-family: var(--sans);
+  }
+  .filter-btn:hover { border-color: var(--accent); color: var(--text); }
+  .filter-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  /* Timeline */
+  .timeline { display: flex; flex-direction: column; gap: 12px; }
+
+  .entry {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    transition: border-color .15s;
+  }
+  .entry:hover { border-color: #30363d; }
+  .entry.disconnection { border-left: 3px solid var(--red); }
+  .entry.reconnection  { border-left: 3px solid var(--green); }
+  .entry.status        { border-left: 3px solid var(--border); }
+
+  .entry-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .entry-header:hover { background: rgba(255,255,255,.02); }
+
+  .entry-time {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .entry-title { flex: 1; font-size: 14px; font-weight: 500; }
+  .entry-signal {
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .chevron { color: var(--muted); font-size: 12px; transition: transform .2s; }
+  .entry.open .chevron { transform: rotate(90deg); }
+
+  .entry-body {
+    display: none;
+    border-top: 1px solid var(--border);
+    padding: 16px;
+  }
+  .entry.open .entry-body { display: block; }
+
+  .section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+    margin: 16px 0 8px;
+  }
+  .section-title:first-child { margin-top: 0; }
+
+  /* Cause list */
+  .cause-list { list-style: none; }
+  .cause-list li {
+    padding: 6px 10px;
+    background: #3a1a1a;
+    border: 1px solid #5a2020;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 6px;
+    color: #ffaaaa;
+  }
+
+  .rec-list { list-style: none; }
+  .rec-list li {
+    padding: 6px 10px;
+    background: #1a2a1a;
+    border: 1px solid #205020;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-bottom: 6px;
+    color: #aaffaa;
+  }
+
+  /* Ping table */
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left;
+    padding: 6px 10px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  td { padding: 7px 10px; border-bottom: 1px solid #1a1f26; font-family: var(--mono); }
+  tr:last-child td { border-bottom: none; }
+
+  /* Signal bar */
+  .signal-bar-wrap { display: flex; align-items: center; gap: 8px; }
+  .signal-bar { height: 6px; border-radius: 3px; background: var(--border); flex: 1; max-width: 100px; overflow: hidden; }
+  .signal-fill { height: 100%; border-radius: 3px; transition: width .3s; }
+
+  .wifi-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 24px;
+    font-size: 13px;
+  }
+  .wifi-row { display: flex; gap: 8px; }
+  .wifi-key { color: var(--muted); min-width: 90px; }
+  .wifi-val { font-family: var(--mono); }
+
+  .empty-state {
+    text-align: center;
+    padding: 64px;
+    color: var(--muted);
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📡 Wi-Fi 監視ログビューア</h1>
+  <span id="headerStatus" class="badge badge-blue">ファイル未読込</span>
+</header>
+
+<div class="container">
+
+  <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+    <div class="icon">📂</div>
+    <p>
+      <strong>ログファイルをここにドラッグ＆ドロップ</strong><br>
+      または クリックしてファイルを選択<br>
+      <span style="font-size:12px;margin-top:4px;display:block;">
+        保存先: ユーザーフォルダ ▶ WiFiMonitor ▶ logs ▶ wifi_log_YYYY-MM-DD.json
+      </span>
+    </p>
+    <input type="file" id="fileInput" accept=".json">
+  </div>
+
+  <div id="statsArea" class="stats" style="display:none"></div>
+
+  <div class="filter-bar" id="filterBar" style="display:none">
+    <button class="filter-btn active" data-filter="all">すべて</button>
+    <button class="filter-btn" data-filter="disconnection">❌ 切断</button>
+    <button class="filter-btn" data-filter="reconnection">🟢 再接続</button>
+    <button class="filter-btn" data-filter="status">📊 ステータス</button>
+  </div>
+
+  <div class="timeline" id="timeline">
+    <div class="empty-state">ログファイルを読み込んでください</div>
+  </div>
+
+</div>
+
+<script>
+let allEntries = [];
+let currentFilter = 'all';
+
+// ---- File loading ----
+const dz = document.getElementById('dropzone');
+const fi = document.getElementById('fileInput');
+
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+dz.addEventListener('drop', e => {
+  e.preventDefault();
+  dz.classList.remove('drag');
+  loadFile(e.dataTransfer.files[0]);
+});
+fi.addEventListener('change', e => loadFile(e.target.files[0]));
+
+function loadFile(file) {
+  if (!file) return;
+  const r = new FileReader();
+  r.onload = e => {
+    try {
+      allEntries = JSON.parse(e.target.result);
+      render();
+    } catch {
+      alert('JSONの読み込みに失敗しました。');
+    }
+  };
+  r.readAsText(file, 'utf-8');
+}
+
+// ---- Render ----
+function render() {
+  const filtered = currentFilter === 'all'
+    ? allEntries
+    : allEntries.filter(e => e.type && e.type.toLowerCase() === currentFilter);
+
+  // Stats
+  const disc = allEntries.filter(e => e.type === 'DISCONNECTION').length;
+  const rec  = allEntries.filter(e => e.type === 'RECONNECTION').length;
+  const stat = allEntries.filter(e => e.type === 'STATUS').length;
+  const avgSig = (() => {
+    const sigs = allEntries
+      .filter(e => e.wifi && e.wifi.signal)
+      .map(e => parseInt(e.wifi.signal));
+    return sigs.length ? Math.round(sigs.reduce((a,b)=>a+b,0)/sigs.length) : null;
+  })();
+
+  document.getElementById('statsArea').style.display = 'grid';
+  document.getElementById('filterBar').style.display = 'flex';
+  document.getElementById('headerStatus').textContent = `${allEntries.length} 件のログ`;
+  document.getElementById('statsArea').innerHTML = `
+    <div class="stat-card"><div class="label">切断回数</div><div class="value red">${disc}</div></div>
+    <div class="stat-card"><div class="label">再接続回数</div><div class="value green">${rec}</div></div>
+    <div class="stat-card"><div class="label">ステータス記録</div><div class="value">${stat}</div></div>
+    ${avgSig !== null ? `<div class="stat-card"><div class="label">平均電波強度</div><div class="value ${avgSig<40?'red':avgSig<60?'yellow':'green'}">${avgSig}%</div></div>` : ''}
+  `;
+
+  // Timeline
+  const tl = document.getElementById('timeline');
+  if (!filtered.length) {
+    tl.innerHTML = '<div class="empty-state">表示するログがありません</div>';
+    return;
+  }
+
+  tl.innerHTML = [...filtered].reverse().map((e, i) => entryHTML(e, i)).join('');
+
+  // Toggle
+  tl.querySelectorAll('.entry-header').forEach(h => {
+    h.addEventListener('click', () => {
+      const entry = h.closest('.entry');
+      entry.classList.toggle('open');
+    });
+  });
+}
+
+function signalColor(s) {
+  if (s >= 70) return '#3fb950';
+  if (s >= 40) return '#d29922';
+  return '#f85149';
+}
+
+function entryHTML(e, i) {
+  const type = (e.type || '').toLowerCase();
+  const ts   = e.timestamp ? e.timestamp.replace('T', ' ').slice(0, 19) : '';
+  const wifi = e.wifi || e.wifi_before || {};
+  const sig  = wifi.signal ? parseInt(wifi.signal) : null;
+  const ssid = wifi.ssid || '---';
+
+  let icon, label, badgeClass;
+  if (type === 'disconnection') { icon='❌'; label='切断'; badgeClass='badge-red'; }
+  else if (type === 'reconnection') { icon='🟢'; label='再接続'; badgeClass='badge-green'; }
+  else { icon='📊'; label='ステータス'; badgeClass='badge-blue'; }
+
+  const sigBar = sig !== null ? `
+    <div class="signal-bar-wrap">
+      <div class="signal-bar"><div class="signal-fill" style="width:${sig}%;background:${signalColor(sig)}"></div></div>
+      <span style="font-family:var(--mono);font-size:12px;color:${signalColor(sig)}">${sig}%</span>
+    </div>` : '';
+
+  // Body content
+  let body = '';
+
+  // Wi-Fi info
+  const wifiTarget = type === 'disconnection' ? e.wifi_before : wifi;
+  if (wifiTarget && Object.keys(wifiTarget).length) {
+    const rows = Object.entries(wifiTarget).map(([k,v]) =>
+      `<div class="wifi-row"><span class="wifi-key">${k}</span><span class="wifi-val">${v}</span></div>`
+    ).join('');
+    body += `<div class="section-title">Wi-Fi 状態${type==='disconnection'?' (切断直前)':''}</div><div class="wifi-grid">${rows}</div>`;
+  }
+
+  // Causes
+  if (e.possible_causes && e.possible_causes.length) {
+    body += `<div class="section-title">考えられる原因</div>
+      <ul class="cause-list">${e.possible_causes.map(c=>`<li>${c}</li>`).join('')}</ul>`;
+  }
+
+  // Recommendations
+  if (e.recommendations && e.recommendations.length) {
+    body += `<div class="section-title">推奨対処</div>
+      <ul class="rec-list">${e.recommendations.map(r=>`<li>→ ${r}</li>`).join('')}</ul>`;
+  }
+
+  // Ping
+  if (e.ping_results && Object.keys(e.ping_results).length) {
+    const rows = Object.values(e.ping_results).map(p => {
+      const ok = p.reachable;
+      return `<tr>
+        <td>${p.host}</td>
+        <td style="color:${ok?'var(--green)':'var(--red)'}">${ok?'✅ 到達':'❌ 不達'}</td>
+        <td>${p.avg_ms != null ? p.avg_ms+'ms' : '---'}</td>
+        <td style="color:${p.loss_pct>0?'var(--red)':'var(--green)'}">${p.loss_pct}%</td>
+      </tr>`;
+    }).join('');
+    body += `<div class="section-title">Ping 診断</div>
+      <table><tr><th>ホスト</th><th>到達</th><th>平均遅延</th><th>ロス率</th></tr>${rows}</table>`;
+  }
+
+  // Nearby APs
+  if (e.nearby_aps && e.nearby_aps.length) {
+    const rows = e.nearby_aps.slice(0, 8).map(ap => {
+      const s = ap.signal || 0;
+      return `<tr><td>${ap.ssid || '---'}</td><td>${ap.channel || '---'}</td>
+        <td><div class="signal-bar-wrap">
+          <div class="signal-bar"><div class="signal-fill" style="width:${s}%;background:${signalColor(s)}"></div></div>
+          <span style="font-size:11px;color:${signalColor(s)}">${s}%</span>
+        </div></td></tr>`;
+    }).join('');
+    body += `<div class="section-title">周辺 AP（切断時）</div>
+      <table><tr><th>SSID</th><th>Ch</th><th>電波強度</th></tr>${rows}</table>`;
+  }
+
+  return `
+  <div class="entry ${type}" id="entry-${i}">
+    <div class="entry-header">
+      <span class="entry-time">${ts}</span>
+      <span class="badge ${badgeClass}">${icon} ${label}</span>
+      <span class="entry-title">${ssid}</span>
+      ${sigBar}
+      ${body ? '<span class="chevron">▶</span>' : ''}
+    </div>
+    ${body ? `<div class="entry-body">${body}</div>` : ''}
+  </div>`;
+}
+
+// Filter buttons
+document.getElementById('filterBar').addEventListener('click', e => {
+  const btn = e.target.closest('.filter-btn');
+  if (!btn) return;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  currentFilter = btn.dataset.filter;
+  render();
+});
+</script>
+</body>
+</html>
