@@ -2,6 +2,7 @@
 Wi-Fi 接続監視・原因特定システム (Windows版)
 監視間隔ごとに接続状況・電波強度・Pingを記録し、
 切断時に詳細な診断レポートを自動生成します。
+定期的に実際の通信速度（Speedtest）も計測・記録します。
 """
 
 import subprocess
@@ -10,14 +11,21 @@ import datetime
 import json
 import re
 import sys
+import threading
 from pathlib import Path
 
 # ===================== 設定 =====================
-CHECK_INTERVAL   = 5        # 監視間隔（秒）
-PING_COUNT       = 4        # Ping送信回数
-LOG_DIR          = Path.home() / "WiFiMonitor" / "logs"
-STATUS_LOG_EVERY = 12       # N回に1回詳細表示＆ログ保存（60秒ごと）
+CHECK_INTERVAL    = 5     # 監視間隔（秒）
+PING_COUNT        = 4     # Ping送信回数
+LOG_DIR           = Path.home() / "WiFiMonitor" / "logs"
+STATUS_LOG_EVERY  = 12    # N回に1回詳細表示＆ログ保存（60秒ごと）
+SPEEDTEST_EVERY   = 10    # N回の詳細表示ごとにSpeedtest実行（約10分ごと）
 # ================================================
+
+# Speedtest結果を保持するグローバル変数
+_speedtest_result  = None
+_speedtest_running = False
+_speedtest_lock    = threading.Lock()
 
 
 def run_cmd(cmd, timeout=15):
@@ -112,6 +120,59 @@ def get_wlan_events(minutes=5):
         return []
 
 
+def run_speedtest_thread():
+    """バックグラウンドでSpeedtestを実行する"""
+    global _speedtest_result, _speedtest_running
+    try:
+        import speedtest as st
+        print("\n  📶 Speedtest 計測中（バックグラウンド）...", flush=True)
+        s = st.Speedtest()
+        s.get_best_server()
+        download = s.download() / 1_000_000   # Mbps
+        upload   = s.upload()   / 1_000_000   # Mbps
+        ping_ms  = s.results.ping
+
+        result = {
+            "timestamp":   datetime.datetime.now().isoformat(),
+            "download_mbps": round(download, 2),
+            "upload_mbps":   round(upload, 2),
+            "ping_ms":       round(ping_ms, 1),
+            "server":        s.results.server.get("name", "---"),
+        }
+
+        with _speedtest_lock:
+            _speedtest_result = result
+
+        print(f"\n  📶 Speedtest 完了 ▼{result['download_mbps']}Mbps ▲{result['upload_mbps']}Mbps Ping:{result['ping_ms']}ms", flush=True)
+
+        save_log({
+            "timestamp": result["timestamp"],
+            "type":      "SPEEDTEST",
+            "speedtest": result,
+        })
+
+    except ImportError:
+        print("\n  ⚠ speedtest-cli が未インストール。'pip install speedtest-cli' を実行してください。", flush=True)
+        with _speedtest_lock:
+            _speedtest_result = {"error": "speedtest-cli not installed"}
+    except Exception as e:
+        print(f"\n  ⚠ Speedtest エラー: {e}", flush=True)
+        with _speedtest_lock:
+            _speedtest_result = {"error": str(e)}
+    finally:
+        _speedtest_running = False
+
+
+def start_speedtest():
+    """Speedtestをバックグラウンドスレッドで起動"""
+    global _speedtest_running
+    if _speedtest_running:
+        return
+    _speedtest_running = True
+    t = threading.Thread(target=run_speedtest_thread, daemon=True)
+    t.start()
+
+
 def analyze_causes(wifi_before, ping_results, gateway):
     causes = []
     recommendations = []
@@ -136,7 +197,7 @@ def analyze_causes(wifi_before, ping_results, gateway):
         causes.append("ゲートウェイには到達できるが、インターネットに出られない")
         recommendations.append("ISP側の障害、またはルーターのWAN側設定を確認してください")
     elif not gw.get("reachable") and ext1.get("reachable"):
-        causes.append("ゲートウェイに到達できないが外部には到達可能（経路の問題）")
+        causes.append("ルーターがPingに一時的に無応答（通信自体は維持されていた可能性あり）")
 
     gw_avg = gw.get("avg_ms")
     if gw_avg and gw_avg > 50:
@@ -179,11 +240,14 @@ def signal_bar(val):
     return f"{bar} {n}%"
 
 
-def print_detail(ts, wifi, gateway, start_dt):
+def print_detail(ts, wifi, gateway, start_dt, detail_count):
     """詳細ステータスを画面に表示"""
     elapsed = datetime.datetime.now() - start_dt
     h, rem  = divmod(int(elapsed.total_seconds()), 3600)
     m, s    = divmod(rem, 60)
+
+    with _speedtest_lock:
+        sp = _speedtest_result
 
     print()
     sep()
@@ -197,33 +261,65 @@ def print_detail(ts, wifi, gateway, start_dt):
     print(f"  電波強度    : {signal_bar(wifi.get('signal', '---'))}")
     print(f"  チャネル    : {wifi.get('channel', '---')} ch")
     print(f"  周波数帯    : {wifi.get('radio_type', '---')}")
-    print(f"  受信速度    : {wifi.get('rx_rate', '---')} Mbps")
-    print(f"  送信速度    : {wifi.get('tx_rate', '---')} Mbps")
+    print(f"  受信速度(L) : {wifi.get('rx_rate', '---')} Mbps  ← リンク速度")
+    print(f"  送信速度(L) : {wifi.get('tx_rate', '---')} Mbps  ← リンク速度")
     print(f"  BSSID       : {wifi.get('bssid', '---')}")
     print(f"  認証方式    : {wifi.get('auth', '---')}")
     sep("-")
-    print(f"  次の詳細更新まで {CHECK_INTERVAL * STATUS_LOG_EVERY} 秒  |  終了: Ctrl+C")
+
+    # Speedtest結果表示
+    if sp is None:
+        print(f"  Speedtest   : 計測待ち（約10分ごとに自動計測）")
+    elif "error" in sp:
+        print(f"  Speedtest   : エラー - {sp['error']}")
+    else:
+        st_ts = sp.get("timestamp", "")[:19].replace("T", " ")
+        print(f"  ▼ ダウンロード: {sp.get('download_mbps', '---')} Mbps  （実測値）")
+        print(f"  ▲ アップロード: {sp.get('upload_mbps',   '---')} Mbps  （実測値）")
+        print(f"  🏓 Ping       : {sp.get('ping_ms',        '---')} ms")
+        print(f"  サーバー      : {sp.get('server',          '---')}")
+        print(f"  計測時刻      : {st_ts}")
+
+    sep("-")
+    next_st_min = (SPEEDTEST_EVERY - (detail_count % SPEEDTEST_EVERY)) * CHECK_INTERVAL * STATUS_LOG_EVERY // 60
+    print(f"  次の詳細更新まで {CHECK_INTERVAL * STATUS_LOG_EVERY} 秒  |  次のSpeedtestまで約{next_st_min}分  |  終了: Ctrl+C")
     sep()
     print()
 
 
 def run_monitor():
-    start_dt = datetime.datetime.now()
+    global _speedtest_result
+
+    start_dt     = datetime.datetime.now()
+    detail_count = 0   # 詳細表示の回数カウント
 
     sep()
     print("  Wi-Fi 接続監視システム  起動完了")
     print(f"  監視開始   : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  ログ保存先 : {LOG_DIR}")
     print(f"  監視間隔   : {CHECK_INTERVAL} 秒")
+    print(f"  Speedtest  : 約{CHECK_INTERVAL * STATUS_LOG_EVERY * SPEEDTEST_EVERY // 60}分ごとに自動計測")
     print("  終了するには Ctrl + C を押してください")
     sep()
 
-    gateway       = get_gateway()
+    # speedtest-cli のインストール確認
+    try:
+        import speedtest
+        print("  [OK] speedtest-cli が使用可能です\n")
+    except ImportError:
+        print("  [!] speedtest-cli が未インストールです")
+        print("  インストールするには次のコマンドを実行してください:")
+        print(f"  %LocalAppData%\\Programs\\Python\\Python314\\python.exe -m pip install speedtest-cli\n")
+
+    gateway   = get_gateway()
     print(f"  デフォルトゲートウェイ: {gateway}\n")
 
     prev_wifi     = {}
     was_connected = None
     loop_count    = 0
+
+    # 起動時に最初のSpeedtestを実行
+    start_speedtest()
 
     while True:
         try:
@@ -242,21 +338,32 @@ def run_monitor():
 
                 # 定期詳細表示＆ログ保存
                 if loop_count % STATUS_LOG_EVERY == 0:
-                    print_detail(ts, wifi, gateway, start_dt)
+                    with _speedtest_lock:
+                        sp = _speedtest_result
+                    print_detail(ts, wifi, gateway, start_dt, detail_count)
                     save_log({
                         "timestamp": datetime.datetime.now().isoformat(),
-                        "type": "STATUS",
-                        "wifi": wifi,
+                        "type":      "STATUS",
+                        "wifi":      wifi,
+                        "speedtest": sp,
                     })
+
+                    # Speedtest定期実行
+                    if detail_count % SPEEDTEST_EVERY == 0 and detail_count > 0:
+                        start_speedtest()
+
+                    detail_count += 1
 
                 # 再接続検出
                 if was_connected is False:
                     print(f"\n\n[{ts}] 🟢 再接続を検出しました！")
                     save_log({
                         "timestamp": datetime.datetime.now().isoformat(),
-                        "type": "RECONNECTION",
-                        "wifi": wifi,
+                        "type":      "RECONNECTION",
+                        "wifi":      wifi,
                     })
+                    # 再接続後にもSpeedtestを実行
+                    start_speedtest()
 
                 was_connected = True
 
