@@ -60,6 +60,7 @@
   .badge-red    { background: #3a1a1a; color: var(--red); }
   .badge-yellow { background: #3a2e10; color: var(--yellow); }
   .badge-blue   { background: #1a2a3a; color: var(--accent); }
+  .badge-yellow { background: #3a2e10; color: var(--yellow); }
 
   .container { max-width: 1000px; margin: 0 auto; padding: 32px 24px; }
 
@@ -131,6 +132,7 @@
   }
   .entry:hover { border-color: #30363d; }
   .entry.disconnection { border-left: 3px solid var(--red); }
+  .entry.speedtest      { border-left: 3px solid #e3a008; }
   .entry.reconnection  { border-left: 3px solid var(--green); }
   .entry.status        { border-left: 3px solid var(--border); }
 
@@ -266,6 +268,7 @@
     <button class="filter-btn" data-filter="disconnection">❌ 切断</button>
     <button class="filter-btn" data-filter="reconnection">🟢 再接続</button>
     <button class="filter-btn" data-filter="status">📊 ステータス</button>
+    <button class="filter-btn" data-filter="speedtest">📶 Speedtest</button>
   </div>
 
   <div class="timeline" id="timeline">
@@ -314,7 +317,12 @@ function render() {
   // Stats
   const disc = allEntries.filter(e => e.type === 'DISCONNECTION').length;
   const rec  = allEntries.filter(e => e.type === 'RECONNECTION').length;
-  const stat = allEntries.filter(e => e.type === 'STATUS').length;
+  const stat  = allEntries.filter(e => e.type === 'STATUS').length;
+  const speed = allEntries.filter(e => e.type === 'SPEEDTEST').length;
+  const avgDl = (() => {
+    const dls = allEntries.filter(e => e.type === 'SPEEDTEST' && e.speedtest && e.speedtest.download_mbps).map(e => e.speedtest.download_mbps);
+    return dls.length ? Math.round(dls.reduce((a,b)=>a+b,0)/dls.length * 10) / 10 : null;
+  })();
   const avgSig = (() => {
     const sigs = allEntries
       .filter(e => e.wifi && e.wifi.signal)
@@ -330,6 +338,8 @@ function render() {
     <div class="stat-card"><div class="label">再接続回数</div><div class="value green">${rec}</div></div>
     <div class="stat-card"><div class="label">ステータス記録</div><div class="value">${stat}</div></div>
     ${avgSig !== null ? `<div class="stat-card"><div class="label">平均電波強度</div><div class="value ${avgSig<40?'red':avgSig<60?'yellow':'green'}">${avgSig}%</div></div>` : ''}
+    ${speed > 0 ? `<div class="stat-card"><div class="label">Speedtest計測回数</div><div class="value">${speed}</div></div>` : ''}
+    ${avgDl !== null ? `<div class="stat-card"><div class="label">平均ダウンロード</div><div class="value yellow">${avgDl} Mbps</div></div>` : ''}
   `;
 
   // Timeline
@@ -364,9 +374,10 @@ function entryHTML(e, i) {
   const ssid = wifi.ssid || '---';
 
   let icon, label, badgeClass;
-  if (type === 'disconnection') { icon='❌'; label='切断'; badgeClass='badge-red'; }
-  else if (type === 'reconnection') { icon='🟢'; label='再接続'; badgeClass='badge-green'; }
-  else { icon='📊'; label='ステータス'; badgeClass='badge-blue'; }
+  if (type === 'disconnection')      { icon='❌'; label='切断';       badgeClass='badge-red'; }
+  else if (type === 'reconnection')  { icon='🟢'; label='再接続';     badgeClass='badge-green'; }
+  else if (type === 'speedtest')     { icon='📶'; label='Speedtest'; badgeClass='badge-yellow'; }
+  else                               { icon='📊'; label='ステータス'; badgeClass='badge-blue'; }
 
   const sigBar = sig !== null ? `
     <div class="signal-bar-wrap">
@@ -427,12 +438,42 @@ function entryHTML(e, i) {
       <table><tr><th>SSID</th><th>Ch</th><th>電波強度</th></tr>${rows}</table>`;
   }
 
+  // Speedtest結果
+  if (type === 'speedtest' && e.speedtest) {
+    const sp = e.speedtest;
+    if (sp.error) {
+      body += `<div class="section-title">エラー</div><p style="color:var(--red);font-size:13px">${sp.error}</p>`;
+    } else {
+      body += `<div class="section-title">計測結果</div>
+        <table>
+          <tr><th>項目</th><th>実測値</th></tr>
+          <tr><td>▼ ダウンロード</td><td style="color:var(--green)">${sp.download_mbps} Mbps</td></tr>
+          <tr><td>▲ アップロード</td><td style="color:var(--accent)">${sp.upload_mbps} Mbps</td></tr>
+          <tr><td>🏓 Ping</td><td>${sp.ping_ms} ms</td></tr>
+          <tr><td>サーバー</td><td>${sp.server || '---'}</td></tr>
+        </table>`;
+    }
+  }
+
+  // STATUSのSpeedtest結果（STATUS内に埋め込まれているもの）
+  if (type === 'status' && e.speedtest && !e.speedtest.error && e.speedtest.download_mbps) {
+    const sp = e.speedtest;
+    body += `<div class="section-title">Speedtest（直近の計測値）</div>
+      <table>
+        <tr><th>項目</th><th>実測値</th></tr>
+        <tr><td>▼ ダウンロード</td><td style="color:var(--green)">${sp.download_mbps} Mbps</td></tr>
+        <tr><td>▲ アップロード</td><td style="color:var(--accent)">${sp.upload_mbps} Mbps</td></tr>
+        <tr><td>🏓 Ping</td><td>${sp.ping_ms} ms</td></tr>
+        <tr><td>サーバー</td><td>${sp.server || '---'}</td></tr>
+      </table>`;
+  }
+
   return `
   <div class="entry ${type}" id="entry-${i}">
     <div class="entry-header">
       <span class="entry-time">${ts}</span>
       <span class="badge ${badgeClass}">${icon} ${label}</span>
-      <span class="entry-title">${ssid}</span>
+      <span class="entry-title">${type === 'speedtest' ? (e.speedtest && !e.speedtest.error ? `▼${e.speedtest.download_mbps}Mbps ▲${e.speedtest.upload_mbps}Mbps Ping:${e.speedtest.ping_ms}ms` : 'エラー') : ssid}</span>
       ${sigBar}
       ${body ? '<span class="chevron">▶</span>' : ''}
     </div>
