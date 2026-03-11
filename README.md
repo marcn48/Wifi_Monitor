@@ -9,7 +9,7 @@ Wi-Fiの接続状況を常時監視し、切断が発生した際に自動で原
 
 ```
 WiFiMonitor/
-├── wifi_monitor.py     ← 監視プログラム本体
+├── wifi_monitor.py     ← 監視プログラム本体　
 ├── 起動.bat            ← 手動起動用バッチファイル（自分で作成が必要）
 └── log_viewer.html     ← ログ確認用ビューア（ブラウザで開く）
 ```
