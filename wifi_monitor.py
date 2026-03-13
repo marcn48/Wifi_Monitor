@@ -15,10 +15,12 @@ import threading
 import ctypes
 import ctypes.wintypes as wt
 import urllib.request
+import concurrent.futures
 from pathlib import Path
 
 # ===================== 設定 =====================
 CHECK_INTERVAL    = 5     # 監視間隔（秒）
+ARP_SCAN_EVERY    = 10    # N回の詳細表示ごとにARPスキャン実行（約10分ごと）
 PING_COUNT        = 4     # Ping送信回数
 LOG_DIR           = Path("C:/WiFiMonitor/logs")
 STATUS_LOG_EVERY  = 12    # N回に1回詳細表示＆ログ保存（60秒ごと）
@@ -36,6 +38,38 @@ _speedtest_lock    = threading.Lock()
 # 位置情報キャッシュ
 _location_cache = None
 _location_lock  = threading.Lock()
+
+# ARPスキャン結果キャッシュ
+_arp_scan_result  = None
+_arp_scan_running = False
+_arp_scan_lock    = threading.Lock()
+
+
+def _arp_scan_worker(gateway):
+    global _arp_scan_result, _arp_scan_running
+    try:
+        result = arp_ping_sweep(gateway)
+        result["timestamp"] = datetime.datetime.now().isoformat()
+        # スキャン後にARPテーブルを再取得してカウント更新
+        result["arp_count"] = get_active_devices()
+        with _arp_scan_lock:
+            _arp_scan_result = result
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        print(f"\n  🔍 ARPスキャン完了: {result['count']} 台が応答 (ARP台数: {result['arp_count']} 台)  [{ts}]", flush=True)
+    except Exception as e:
+        print(f"\n  ⚠ ARPスキャン エラー: {e}", flush=True)
+    finally:
+        _arp_scan_running = False
+
+
+def start_arp_scan(gateway):
+    global _arp_scan_running
+    with _arp_scan_lock:
+        if _arp_scan_running:
+            return
+        _arp_scan_running = True
+    t = threading.Thread(target=_arp_scan_worker, args=(gateway,), daemon=True)
+    t.start()
 
 
 def _setup_close_handler():
@@ -327,6 +361,37 @@ def get_active_devices():
         return None
 
 
+def arp_ping_sweep(gateway, timeout_ms=300):
+    """
+    サブネット全体にICMP pingを並列送信し、ARPテーブルを更新する。
+    戻り値: { count: int, hosts: [str] }  ← 応答があったIPの一覧
+    実行はバックグラウンドスレッドで行う想定。所要時間は約5〜15秒。
+    """
+    # ゲートウェイからサブネットプレフィックスを推定（例: 192.168.1.x）
+    parts = gateway.split(".")
+    if len(parts) != 4:
+        return {"count": 0, "hosts": []}
+    prefix = ".".join(parts[:3])
+
+    def _ping_host(ip):
+        try:
+            r = subprocess.run(
+                ["ping", "-n", "1", "-w", str(timeout_ms), ip],
+                capture_output=True, timeout=2
+            )
+            out = r.stdout.decode("cp932", errors="ignore")
+            return ip if ("TTL" in out or "ttl" in out) else None
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
+        targets = [f"{prefix}.{i}" for i in range(1, 255)]
+        results = list(ex.map(_ping_host, targets))
+
+    hosts = [h for h in results if h]
+    return {"count": len(hosts), "hosts": sorted(hosts, key=lambda x: int(x.split(".")[-1]))}
+
+
 def get_gateway():
     out = run_cmd(["ipconfig"])
     m = re.search(r"Default Gateway[.\s]*:\s*([\d.]+)", out)
@@ -420,14 +485,14 @@ def get_bss_scan(current_bssid=""):
                 "signal":       int(signal_m.group(1)) if signal_m else None,
                 "band":         band_m.group(1).strip() if band_m else None,
                 "channel":      int(chan_m.group(1)) if chan_m else None,
-                "stations":     int(station_m.group(1)) if station_m else 0,
+                "stations":     int(station_m.group(1)) if station_m else None,  # Noneは非対応AP
                 "radio":        radio_m.group(1).strip() if radio_m else None,
                 "is_mine":      bssid == current_bssid.lower(),
                 "ch_util_pct":  int(util_m.group(2)) if util_m else None,
                 "ch_util_raw":  int(util_m.group(1)) if util_m else None,
             })
 
-        ssid_total = sum(b["stations"] for b in bssid_list)
+        ssid_total = sum(b["stations"] for b in bssid_list if b["stations"] is not None)
         ssid_list.append({
             "ssid":     ssid_name,
             "auth":     auth,
@@ -484,16 +549,19 @@ def print_bss_scan(scan, label="定期"):
     print(f"  │")
     for s in scan.get("ssids", []):
         ssid_label = s["ssid"] if s["ssid"] else f"(名称なし / {s['auth']})"
-        print(f"  │  [{ssid_label}]  合計 {s['total']} 台")
+        all_unsupported = all(b["stations"] is None for b in s.get("bssids", [])) and s.get("bssids")
+        total_str = "BSS Load非対応" if all_unsupported else f"合計 {s['total']} 台"
+        print(f"  │  [{ssid_label}]  {total_str}")
         for b in s.get("bssids", []):
             mine  = "★ " if b["is_mine"] else "  "
             band  = b["band"] or "---"
             ch    = b["channel"] or "---"
             sig   = f"{b['signal']}%" if b["signal"] is not None else "---"
-            st    = b["stations"]
+            st    = f"{b['stations']}台" if b["stations"] is not None else "非対応"
             util  = f"  Ch使用率:{b['ch_util_pct']}%" if b.get("ch_util_pct") is not None else ""
             mine_label = "  ← 自分が接続中" if b["is_mine"] else ""
-            print(f"  │  {mine}{b['bssid']}  {band} Ch{ch}  {st}台  シグナル:{sig}{util}{mine_label}")
+            # 台数が非対応の場合はSSID合計行にも注記
+            print(f"  │  {mine}{b['bssid']}  {band} Ch{ch}  {st}  シグナル:{sig}{util}{mine_label}")
     print(f"  └──────────────────────────────────────────────────")
 
 
@@ -674,7 +742,7 @@ def signal_bar(val):
     return f"{bar} {n}%"
 
 
-def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None, packet_loss=None):
+def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None, packet_loss=None, arp_scan=None):
     """詳細ステータスを画面に表示"""
     elapsed = datetime.datetime.now() - start_dt
     h, rem  = divmod(int(elapsed.total_seconds()), 3600)
@@ -690,7 +758,13 @@ def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None,
     print(f"  監視開始    : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  経過時間    : {h:02d}:{m:02d}:{s:02d}")
     print(f"  ゲートウェイ: {gateway}")
-    dev_str = f"{active_devices} 台（ARPテーブル）" if active_devices is not None else "---"
+    # ARPスキャン済みならping応答数も併記
+    if arp_scan:
+        arp_ts   = arp_scan.get("timestamp", "")
+        arp_time = arp_ts[11:16] if arp_ts else "---"
+        dev_str  = f"{active_devices} 台（ARPテーブル）  ping応答: {arp_scan['count']} 台 / {arp_time} 取得"
+    else:
+        dev_str = f"{active_devices} 台（ARPテーブル）" if active_devices is not None else "---（ARPスキャン待ち）"
     print(f"  アクティブ機器: {dev_str}")
     # BSSキャッシュから接続台数を表示（自分が接続中のBSSIDの台数 + エリア合計）
     if _bss_cache:
@@ -802,6 +876,9 @@ def run_monitor():
     # 起動時に最初のSpeedtestを実行
     start_speedtest()
 
+    # 起動時にARPスキャンを実行（バックグラウンド）
+    start_arp_scan(gateway)
+
     # 起動時にBSSスキャンを実行（接続済みの場合のみ）
     _startup_wifi = get_wifi_info()
     _startup_bssid = _startup_wifi.get("bssid", "")
@@ -855,11 +932,14 @@ def run_monitor():
                 if loop_count % STATUS_LOG_EVERY == 0:
                     with _speedtest_lock:
                         sp = _speedtest_result
-                    active_devices = get_active_devices()
+                    # ARPスキャン済みならその結果でactive_devicesを更新
+                    with _arp_scan_lock:
+                        arp_scan = _arp_scan_result
+                    active_devices = arp_scan["arp_count"] if arp_scan else get_active_devices()
                     # パケットロス定期計測（ゲートウェイへ4回ping）
                     pkt = quick_ping_loss(gateway, count=4)
                     print_detail(ts, wifi, gateway, start_dt, detail_count,
-                                 active_devices, packet_loss=pkt)
+                                 active_devices, packet_loss=pkt, arp_scan=arp_scan)
                     with _location_lock:
                         loc = _location_cache
                     save_log({
@@ -868,6 +948,7 @@ def run_monitor():
                         "wifi":           wifi,
                         "speedtest":      sp,
                         "active_devices": active_devices,
+                        "arp_scan":       arp_scan,
                         "packet_loss":    pkt,
                         "location":       loc,
                     })
@@ -875,6 +956,10 @@ def run_monitor():
                     # Speedtest定期実行
                     if detail_count % SPEEDTEST_EVERY == 0 and detail_count > 0:
                         start_speedtest()
+
+                    # ARPスキャン定期実行（約10分ごと）
+                    if detail_count % ARP_SCAN_EVERY == 0 and detail_count > 0:
+                        start_arp_scan(gateway)
 
                     # BSSスキャン定期実行（約10分ごと）
                     if detail_count % BSS_SCAN_EVERY == 0 and detail_count > 0:
