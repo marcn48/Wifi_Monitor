@@ -23,6 +23,7 @@ PING_COUNT        = 4     # Ping送信回数
 LOG_DIR           = Path("C:/WiFiMonitor/logs")
 STATUS_LOG_EVERY  = 12    # N回に1回詳細表示＆ログ保存（60秒ごと）
 SPEEDTEST_EVERY   = 30    # N回の詳細表示ごとにSpeedtest実行（約30分ごと）
+BSS_SCAN_EVERY    = 10    # N回の詳細表示ごとにBSSスキャン実行（約10分ごと）
 LOCATION_EVERY    = 30    # N分ごとに位置情報を再取得（スリープ復帰後にも即更新）
 SLEEP_DETECT_SEC  = 30    # N秒以上ループが遅延したらスリープ復帰と判断
 # ================================================
@@ -82,10 +83,15 @@ def _setup_close_handler():
 def run_cmd(cmd, timeout=15):
     try:
         r = subprocess.run(
-            cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="ignore", timeout=timeout
+            cmd, capture_output=True, timeout=timeout
         )
-        return r.stdout
+        # 日本語WindowsはCP932（Shift-JIS）で出力するため、まずCP932でデコードを試みる
+        for enc in ("cp932", "utf-8"):
+            try:
+                return r.stdout.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return r.stdout.decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
@@ -102,6 +108,94 @@ def signal_to_rssi(signal_pct):
     try:
         s = int(str(signal_pct).replace('%', ''))
         rssi = round(s / 2 - 100)
+        return rssi
+    except Exception:
+        return None
+
+
+# ---- WlanApi 実RSSI取得 ----------------------------------------
+import ctypes, ctypes.wintypes
+
+def _get_real_rssi(target_bssid: str):
+    """
+    Wlanapi.dll の WlanGetNetworkBssList を呼び出し、
+    接続中BSSIDの実RSSIを dBm で返す。
+    取得失敗時は None（fallbackとして signal_to_rssi を使う）。
+    """
+    try:
+        wlan = ctypes.windll.wlanapi
+
+        ver    = ctypes.wintypes.DWORD()
+        handle = ctypes.wintypes.HANDLE()
+        if wlan.WlanOpenHandle(2, None, ctypes.byref(ver), ctypes.byref(handle)) != 0:
+            return None
+
+        class WLAN_INTERFACE_INFO(ctypes.Structure):
+            _fields_ = [("InterfaceGuid",            ctypes.c_byte * 16),
+                        ("strInterfaceDescription",   ctypes.c_wchar * 256),
+                        ("isState",                   ctypes.c_uint)]
+
+        class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+            _fields_ = [("dwNumberOfItems", ctypes.wintypes.DWORD),
+                        ("dwIndex",         ctypes.wintypes.DWORD),
+                        ("InterfaceInfo",   WLAN_INTERFACE_INFO * 64)]
+
+        p_iface = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
+        if wlan.WlanEnumInterfaces(handle, None, ctypes.byref(p_iface)) != 0:
+            wlan.WlanCloseHandle(handle, None)
+            return None
+
+        iface_list = p_iface.contents
+        if iface_list.dwNumberOfItems == 0:
+            wlan.WlanFreeMemory(p_iface)
+            wlan.WlanCloseHandle(handle, None)
+            return None
+
+        guid = (ctypes.c_byte * 16)(*iface_list.InterfaceInfo[0].InterfaceGuid)
+
+        class WLAN_BSS_ENTRY(ctypes.Structure):
+            _fields_ = [
+                ("dot11Ssid",               ctypes.c_byte * 36),
+                ("uPhyId",                  ctypes.wintypes.DWORD),
+                ("dot11Bssid",              ctypes.c_byte * 6),
+                ("dot11BssType",            ctypes.c_uint),
+                ("dot11BssPhyType",         ctypes.c_uint),
+                ("lRssi",                   ctypes.c_long),
+                ("uLinkQuality",            ctypes.wintypes.DWORD),
+                ("bInRegDomain",            ctypes.c_bool),
+                ("usBeaconPeriod",          ctypes.c_ushort),
+                ("ullTimestamp",            ctypes.c_ulonglong),
+                ("ullHostTimestamp",        ctypes.c_ulonglong),
+                ("usCapabilityInformation", ctypes.c_ushort),
+                ("ulChCenterFrequency",     ctypes.wintypes.DWORD),
+                ("wlanRateSet",             ctypes.c_byte * 130),
+                ("ulIeOffset",              ctypes.wintypes.DWORD),
+                ("ulIeSize",                ctypes.wintypes.DWORD),
+            ]
+
+        class WLAN_BSS_LIST(ctypes.Structure):
+            _fields_ = [("dwTotalSize",     ctypes.wintypes.DWORD),
+                        ("dwNumberOfItems", ctypes.wintypes.DWORD),
+                        ("wlanBssEntries",  WLAN_BSS_ENTRY * 256)]
+
+        p_bss = ctypes.POINTER(WLAN_BSS_LIST)()
+        ret   = wlan.WlanGetNetworkBssList(
+            handle, ctypes.byref(guid), None, 1, None, None, ctypes.byref(p_bss))
+
+        rssi = None
+        if ret == 0:
+            bss_list = p_bss.contents
+            target   = target_bssid.lower().replace(":", "")
+            for i in range(bss_list.dwNumberOfItems):
+                entry = bss_list.wlanBssEntries[i]
+                mac   = "".join(f"{b:02x}" for b in entry.dot11Bssid)
+                if mac == target:
+                    rssi = int(entry.lRssi)
+                    break
+            wlan.WlanFreeMemory(p_bss)
+
+        wlan.WlanFreeMemory(p_iface)
+        wlan.WlanCloseHandle(handle, None)
         return rssi
     except Exception:
         return None
@@ -126,12 +220,20 @@ def get_wifi_info():
         if m:
             info[key] = m.group(1).strip()
 
-    # RSSI / SNR を signal% から逆算
+    # RSSI / SNR: まず WlanApi で実値取得、失敗時は signal% から逆算
     if "signal" in info:
-        rssi = signal_to_rssi(info["signal"])
-        if rssi is not None:
-            info["rssi_dbm"] = rssi
-            info["snr_db"]   = rssi - NOISE_FLOOR_DBM  # 推定SNR
+        bssid = info.get("bssid", "")
+        real_rssi = _get_real_rssi(bssid) if bssid else None
+        if real_rssi is not None:
+            info["rssi_dbm"]      = real_rssi
+            info["rssi_source"]   = "wlanapi"   # 実測値
+        else:
+            est = signal_to_rssi(info["signal"])
+            if est is not None:
+                info["rssi_dbm"]    = est
+                info["rssi_source"] = "estimated"  # 逆算値
+        if info.get("rssi_dbm") is not None:
+            info["snr_db"] = info["rssi_dbm"] - NOISE_FLOOR_DBM
 
     return info
 
@@ -233,10 +335,11 @@ def get_gateway():
 
 def ping(host, count=4):
     out = run_cmd(["ping", "-n", str(count), host], timeout=20)
-    loss_m = re.search(r"(\d+)% loss", out)
-    avg_m  = re.search(r"Average = (\d+)ms", out)
-    min_m  = re.search(r"Minimum = (\d+)ms", out)
-    max_m  = re.search(r"Maximum = (\d+)ms", out)
+    # 日本語: "0% の損失" / 英語: "0% loss"
+    loss_m = re.search(r"(\d+)%\s*(?:の損失|loss)", out)
+    avg_m  = re.search(r"(?:Average|平均)\s*=\s*(\d+)\s*ms", out, re.IGNORECASE)
+    min_m  = re.search(r"(?:Minimum|最小)\s*=\s*(\d+)\s*ms", out, re.IGNORECASE)
+    max_m  = re.search(r"(?:Maximum|最大)\s*=\s*(\d+)\s*ms", out, re.IGNORECASE)
     loss   = int(loss_m.group(1)) if loss_m else 100
     return {
         "host":      host,
@@ -248,7 +351,112 @@ def ping(host, count=4):
     }
 
 
+def quick_ping_loss(host, count=4):
+    """
+    定期パケットロス計測用の軽量版ping。
+    戻り値: { loss_pct: int, avg_ms: int|None }
+    失敗時: { loss_pct: 100, avg_ms: None }
+    """
+    try:
+        out    = run_cmd(["ping", "-n", str(count), "-w", "1000", host], timeout=15)
+        # 日本語: "0% の損失" / 英語: "0% loss"
+        loss_m = re.search(r"(\d+)%\s*(?:の損失|loss)", out)
+        avg_m  = re.search(r"(?:Average|平均)\s*=\s*(\d+)\s*ms", out, re.IGNORECASE)
+        loss   = int(loss_m.group(1)) if loss_m else 100
+        return {
+            "loss_pct": loss,
+            "avg_ms":   int(avg_m.group(1)) if avg_m else None,
+        }
+    except Exception:
+        return {"loss_pct": 100, "avg_ms": None}
+
+
+_bss_cache = None  # 直前の有効なBSSスキャン結果をキャッシュ
+
+
+def get_bss_scan(current_bssid=""):
+    """
+    BSSスキャン: SSIDごと・BSSIDごとの接続台数・電波状況を取得する。
+    current_bssid: 自分が現在接続しているBSSID（強調表示用）
+    戻り値: { ssids: [...], total_stations: int, cached: bool }
+    出力が空/不完全な場合は直前のキャッシュを返す（cached=True）。
+    """
+    global _bss_cache
+
+    out = run_cmd(["netsh", "wlan", "show", "networks", "mode=bssid"])
+
+    # SSIDブロックに分割
+    # 注意: "BSSID \d+" にも "SSID \d+" が含まれるため負の後読みで除外
+    ssid_blocks = re.split(r"(?<!B)(?=SSID \d+\s*:)", out)
+    ssid_list = []
+
+    for block in ssid_blocks:
+        # 先頭行のSSID名を取得（"BSSID"行にはマッチしないよう行頭を想定）
+        ssid_m = re.search(r"(?<!B)SSID \d+\s*:[ \t]*(.*)", block)
+        if not ssid_m:
+            continue
+        ssid_name = ssid_m.group(1).strip()
+        auth_m    = re.search(r"(?:Authentication|認証)\s*:\s*(.+)", block)
+        auth      = auth_m.group(1).strip() if auth_m else ""
+
+        # BSSIDブロックに分割
+        bssid_blocks = re.split(r"(?=BSSID \d+\s*:)", block)
+        bssid_list = []
+        for bb in bssid_blocks:
+            bssid_m   = re.search(r"BSSID \d+\s*:\s*([0-9a-f:]+)", bb, re.IGNORECASE)
+            signal_m  = re.search(r"(?:Signal|シグナル)\s*:\s*(\d+)%", bb)
+            band_m    = re.search(r"(?:Band|バンド)\s*:\s*(.+)", bb)
+            chan_m    = re.search(r"(?:Channel|チャネル)\s*:\s*(\d+)", bb)
+            # 「接続されているステーション」と「接続されていステーション」の両表記に対応
+            station_m = re.search(r"(?:接続されてい[るい]?\s*ステーション|Connected\s+[Ss]tations?)\s*:\s*(\d+)", bb)
+            radio_m   = re.search(r"(?:Radio type|無線タイプ)\s*:\s*(.+)", bb)
+            # チャンネル使用率: "チャンネル使用率: 85 (33 %)" または "Channel Utilization: 85 (33 %)"
+            util_m    = re.search(r"(?:チャンネル使用率|Channel [Uu]tilization)\s*:\s*(\d+)\s*\((\d+)\s*%\)", bb)
+            if not bssid_m:
+                continue
+            bssid = bssid_m.group(1).strip().lower()
+            bssid_list.append({
+                "bssid":        bssid,
+                "signal":       int(signal_m.group(1)) if signal_m else None,
+                "band":         band_m.group(1).strip() if band_m else None,
+                "channel":      int(chan_m.group(1)) if chan_m else None,
+                "stations":     int(station_m.group(1)) if station_m else 0,
+                "radio":        radio_m.group(1).strip() if radio_m else None,
+                "is_mine":      bssid == current_bssid.lower(),
+                "ch_util_pct":  int(util_m.group(2)) if util_m else None,
+                "ch_util_raw":  int(util_m.group(1)) if util_m else None,
+            })
+
+        ssid_total = sum(b["stations"] for b in bssid_list)
+        ssid_list.append({
+            "ssid":     ssid_name,
+            "auth":     auth,
+            "bssids":   bssid_list,
+            "total":    ssid_total,
+        })
+
+    # BSSIDエントリが1件も取れなかった場合はキャッシュにフォールバック
+    total_bssid_entries = sum(len(s["bssids"]) for s in ssid_list)
+    if total_bssid_entries == 0 and _bss_cache is not None:
+        cached = dict(_bss_cache)
+        cached["cached"] = True
+        # is_mine フラグだけ現在のBSSIDで更新する
+        if current_bssid:
+            for s in cached["ssids"]:
+                for b in s["bssids"]:
+                    b["is_mine"] = (b["bssid"] == current_bssid.lower())
+        return cached
+
+    result = {"ssids": ssid_list, "total_stations": sum(s["total"] for s in ssid_list), "cached": False,
+              "timestamp": datetime.datetime.now().isoformat()}
+    # BSSIDエントリがあれば正式キャッシュ。SSIDのみ（BSSIDなし）でも初回キャッシュとして保存
+    if total_bssid_entries > 0 or (ssid_list and _bss_cache is None):
+        _bss_cache = result
+    return result
+
+
 def get_nearby_aps():
+    """切断診断用（後方互換）: 簡易AP一覧を返す"""
     out = run_cmd(["netsh", "wlan", "show", "networks", "mode=bssid"])
     aps = []
     blocks = re.split(r"(?=SSID \d+)", out)
@@ -263,6 +471,30 @@ def get_nearby_aps():
                 "channel": int(chan_m.group(1)) if chan_m else None,
             })
     return aps
+
+
+def print_bss_scan(scan, label="定期"):
+    """BSSスキャン結果をコンソールに表示する"""
+    total      = scan.get("total_stations", 0)
+    is_cached  = scan.get("cached", False)
+    cache_note = "  ※ キャッシュ使用（スキャン不完全）" if is_cached else ""
+    print(f"\n  ┌─ BSSスキャン結果（{label}）{cache_note}─────────────────────────")
+    print(f"  │  エリア全体の接続台数: {total} 台")
+    print(f"  │  ※ BSS台数=APが把握する実接続数  ARP台数=自PC経由の推定値")
+    print(f"  │")
+    for s in scan.get("ssids", []):
+        ssid_label = s["ssid"] if s["ssid"] else f"(名称なし / {s['auth']})"
+        print(f"  │  [{ssid_label}]  合計 {s['total']} 台")
+        for b in s.get("bssids", []):
+            mine  = "★ " if b["is_mine"] else "  "
+            band  = b["band"] or "---"
+            ch    = b["channel"] or "---"
+            sig   = f"{b['signal']}%" if b["signal"] is not None else "---"
+            st    = b["stations"]
+            util  = f"  Ch使用率:{b['ch_util_pct']}%" if b.get("ch_util_pct") is not None else ""
+            mine_label = "  ← 自分が接続中" if b["is_mine"] else ""
+            print(f"  │  {mine}{b['bssid']}  {band} Ch{ch}  {st}台  シグナル:{sig}{util}{mine_label}")
+    print(f"  └──────────────────────────────────────────────────")
 
 
 def get_wlan_events(minutes=5):
@@ -286,19 +518,56 @@ def get_wlan_events(minutes=5):
 
 
 def run_speedtest_thread():
-    """バックグラウンドでSpeedtestを実行する"""
+    """バックグラウンドでSpeedtestを実行する（403時は別サーバーに自動切替）"""
     global _speedtest_result, _speedtest_running
+    MAX_RETRY = 6  # 最大試行サーバー数
     try:
         import speedtest as st
         print("\n  📶 Speedtest 計測中（バックグラウンド）...", flush=True)
         s = st.Speedtest()
-        s.get_best_server()
-        download = s.download() / 1_000_000   # Mbps
-        upload   = s.upload()   / 1_000_000   # Mbps
-        ping_ms  = s.results.ping
+
+        # 全サーバーをレイテンシ順に取得
+        s.get_servers()
+        all_servers = sorted(
+            [sv for slist in s.servers.values() for sv in slist],
+            key=lambda x: x.get("latency", 9999)
+        )
+
+        tried_ids = set()
+        last_error = None
+        success = False
+
+        for attempt, sv in enumerate(all_servers, start=1):
+            if attempt > MAX_RETRY:
+                break
+            sv_id = sv.get("id")
+            if sv_id in tried_ids:
+                continue
+            tried_ids.add(sv_id)
+
+            try:
+                s.get_best_server([sv])
+                download = s.download() / 1_000_000
+                upload   = s.upload()   / 1_000_000
+                ping_ms  = s.results.ping
+                last_error = None
+                success = True
+                break  # 成功
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "403" in err_str or "Forbidden" in err_str:
+                    print(f"\n  ⚠ Speedtest 403 [{sv.get('name','?')}] → 次のサーバーへ ({attempt}/{MAX_RETRY})", flush=True)
+                    continue  # 次のサーバーを試す
+                else:
+                    # 403以外（ネットワーク断など）はリトライしない
+                    break
+
+        if not success:
+            raise last_error or Exception("全サーバーで計測失敗")
 
         result = {
-            "timestamp":   datetime.datetime.now().isoformat(),
+            "timestamp":     datetime.datetime.now().isoformat(),
             "download_mbps": round(download, 2),
             "upload_mbps":   round(upload, 2),
             "ping_ms":       round(ping_ms, 1),
@@ -308,7 +577,7 @@ def run_speedtest_thread():
         with _speedtest_lock:
             _speedtest_result = result
 
-        print(f"\n  📶 Speedtest 完了 ▼{result['download_mbps']}Mbps ▲{result['upload_mbps']}Mbps Ping:{result['ping_ms']}ms", flush=True)
+        print(f"\n  📶 Speedtest 完了 ▼{result['download_mbps']}Mbps ▲{result['upload_mbps']}Mbps Ping:{result['ping_ms']}ms (サーバー: {result['server']})", flush=True)
 
         save_log({
             "timestamp": result["timestamp"],
@@ -405,7 +674,7 @@ def signal_bar(val):
     return f"{bar} {n}%"
 
 
-def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None):
+def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None, packet_loss=None):
     """詳細ステータスを画面に表示"""
     elapsed = datetime.datetime.now() - start_dt
     h, rem  = divmod(int(elapsed.total_seconds()), 3600)
@@ -423,6 +692,23 @@ def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None)
     print(f"  ゲートウェイ: {gateway}")
     dev_str = f"{active_devices} 台（ARPテーブル）" if active_devices is not None else "---"
     print(f"  アクティブ機器: {dev_str}")
+    # BSSキャッシュから接続台数を表示（自分が接続中のBSSIDの台数 + エリア合計）
+    if _bss_cache:
+        bss_total = _bss_cache.get("total_stations", 0)
+        bss_ts    = _bss_cache.get("timestamp", "")
+        bss_time  = bss_ts[11:16] if bss_ts else "---"
+        mine_stations = None
+        current_bssid = wifi.get("bssid", "").lower()
+        for s in _bss_cache.get("ssids", []):
+            for b in s.get("bssids", []):
+                if b.get("bssid") == current_bssid:
+                    mine_stations = b.get("stations")
+                    break
+        cached_note = "キャッシュ" if _bss_cache.get("cached") else f"{bss_time} 取得"
+        mine_str = f"  自AP:{mine_stations}台" if mine_stations is not None else ""
+        print(f"  BSS接続台数 : {bss_total} 台（エリア合計{mine_str} / {cached_note}）")
+    else:
+        print(f"  BSS接続台数 : --- （取得待ち・約10分ごとに自動更新）")
     with _location_lock:
         loc = _location_cache
     if loc:
@@ -439,13 +725,21 @@ def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None)
     print(f"  BSSID       : {wifi.get('bssid', '---')}")
     print(f"  認証方式    : {wifi.get('auth', '---')}")
     if wifi.get('rssi_dbm') is not None:
-        print(f"  RSSI        : {wifi.get('rssi_dbm')} dBm")
-        print(f"  SNR (推定)  : {wifi.get('snr_db')} dB")
+        src = "実測値" if wifi.get("rssi_source") == "wlanapi" else "推定値"
+        snr_src = "実測RSSI基準" if wifi.get("rssi_source") == "wlanapi" else "推定"
+        print(f"  RSSI        : {wifi.get('rssi_dbm')} dBm  ({src})")
+        print(f"  SNR ({snr_src}): {wifi.get('snr_db')} dB")
+    if packet_loss is not None:
+        loss = packet_loss.get("loss_pct", 100)
+        avg  = packet_loss.get("avg_ms")
+        loss_icon = "✅" if loss == 0 else ("⚠" if loss < 50 else "❌")
+        avg_str  = f"  Ping:{avg}ms" if avg is not None else ""
+        print(f"  パケットロス: {loss_icon} {loss}%{avg_str}  (GW宛4回)")
     sep("-")
 
     # Speedtest結果表示
     if sp is None:
-        print(f"  Speedtest   : 計測待ち（約10分ごとに自動計測）")
+        print(f"  Speedtest   : 計測待ち（約{CHECK_INTERVAL * STATUS_LOG_EVERY * SPEEDTEST_EVERY // 60}分ごとに自動計測）")
     elif "error" in sp:
         print(f"  Speedtest   : エラー - {sp['error']}")
     else:
@@ -497,14 +791,29 @@ def run_monitor():
     start_location_update()
     print()
 
-    prev_wifi          = {}
-    was_connected      = None
-    loop_count         = 0
-    last_loop_time     = datetime.datetime.now()
-    last_location_time = datetime.datetime.now()
+    prev_wifi           = {}
+    was_connected       = None
+    bssid_at_disconnect = None   # 切断直前のBSSID（再接続時のローミング判定用）
+    loop_count          = 0
+    last_loop_time      = datetime.datetime.now()
+    last_location_time  = datetime.datetime.now()
+    last_bss_scan_count = 0      # BSSスキャン実行済みの detail_count
 
     # 起動時に最初のSpeedtestを実行
     start_speedtest()
+
+    # 起動時にBSSスキャンを実行（接続済みの場合のみ）
+    _startup_wifi = get_wifi_info()
+    _startup_bssid = _startup_wifi.get("bssid", "")
+    if _startup_bssid:
+        bss = get_bss_scan(current_bssid=_startup_bssid)
+        print_bss_scan(bss, label="起動時")
+        save_log({
+            "timestamp": datetime.datetime.now().isoformat(),
+            "type":      "BSS_SCAN",
+            "trigger":   "startup",
+            "bss_scan":  bss,
+        })
 
     while True:
         try:
@@ -547,7 +856,10 @@ def run_monitor():
                     with _speedtest_lock:
                         sp = _speedtest_result
                     active_devices = get_active_devices()
-                    print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices)
+                    # パケットロス定期計測（ゲートウェイへ4回ping）
+                    pkt = quick_ping_loss(gateway, count=4)
+                    print_detail(ts, wifi, gateway, start_dt, detail_count,
+                                 active_devices, packet_loss=pkt)
                     with _location_lock:
                         loc = _location_cache
                     save_log({
@@ -556,6 +868,7 @@ def run_monitor():
                         "wifi":           wifi,
                         "speedtest":      sp,
                         "active_devices": active_devices,
+                        "packet_loss":    pkt,
                         "location":       loc,
                     })
 
@@ -563,18 +876,76 @@ def run_monitor():
                     if detail_count % SPEEDTEST_EVERY == 0 and detail_count > 0:
                         start_speedtest()
 
+                    # BSSスキャン定期実行（約10分ごと）
+                    if detail_count % BSS_SCAN_EVERY == 0 and detail_count > 0:
+                        bss = get_bss_scan(current_bssid=wifi.get("bssid", ""))
+                        print_bss_scan(bss, label="定期")
+                        last_bss_scan_count = detail_count
+                        save_log({
+                            "timestamp":  datetime.datetime.now().isoformat(),
+                            "type":       "BSS_SCAN",
+                            "trigger":    "periodic",
+                            "bss_scan":   bss,
+                        })
+
                     detail_count += 1
 
                 # 再接続検出
                 if was_connected is False:
-                    print(f"\n\n[{ts}] 🟢 再接続を検出しました！")
-                    save_log({
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "type":      "RECONNECTION",
-                        "wifi":      wifi,
-                    })
+                    curr_bssid = wifi.get("bssid", "")
+                    is_roaming_reconnect = (
+                        bssid_at_disconnect and curr_bssid
+                        and bssid_at_disconnect != curr_bssid.lower()
+                    )
+                    if is_roaming_reconnect:
+                        print(f"\n\n[{ts}] 🔀 ローミング（切断経由）を検出！")
+                        print(f"  BSSID: {bssid_at_disconnect} → {curr_bssid}")
+                        # ローミング後にBSSスキャンを実行
+                        bss = get_bss_scan(current_bssid=curr_bssid)
+                        print_bss_scan(bss, label="ローミング後")
+                        save_log({
+                            "timestamp":    datetime.datetime.now().isoformat(),
+                            "type":         "ROAMING",
+                            "roaming_via":  "disconnect",
+                            "bssid_from":   bssid_at_disconnect,
+                            "bssid_to":     curr_bssid,
+                            "channel_from": prev_wifi.get("channel", "---"),
+                            "channel_to":   wifi.get("channel", "---"),
+                            "wifi":         wifi,
+                            "bss_scan":     bss,
+                        })
+                    else:
+                        print(f"\n\n[{ts}] 🟢 再接続を検出しました！")
+                        save_log({
+                            "timestamp": datetime.datetime.now().isoformat(),
+                            "type":      "RECONNECTION",
+                            "wifi":      wifi,
+                        })
+                    bssid_at_disconnect = None
                     # 再接続後にもSpeedtestを実行
                     start_speedtest()
+
+                # シームレスローミング検出（接続維持のままBSSIDが変化）
+                elif was_connected is True:
+                    prev_bssid = prev_wifi.get("bssid", "")
+                    curr_bssid = wifi.get("bssid", "")
+                    if prev_bssid and curr_bssid and prev_bssid != curr_bssid:
+                        prev_ch = prev_wifi.get("channel", "---")
+                        curr_ch = wifi.get("channel", "---")
+                        print(f"\n\n[{ts}] 🔀 ローミングを検出！")
+                        print(f"  BSSID: {prev_bssid} (Ch:{prev_ch}) → {curr_bssid} (Ch:{curr_ch})")
+                        bss = get_bss_scan(current_bssid=curr_bssid)
+                        print_bss_scan(bss, label="ローミング後")
+                        save_log({
+                            "timestamp":    datetime.datetime.now().isoformat(),
+                            "type":         "ROAMING",
+                            "bssid_from":   prev_bssid,
+                            "bssid_to":     curr_bssid,
+                            "channel_from": prev_ch,
+                            "channel_to":   curr_ch,
+                            "wifi":         wifi,
+                            "bss_scan":     bss,
+                        })
 
                 was_connected = True
 
@@ -651,6 +1022,7 @@ def run_monitor():
                 else:
                     print(f"\r[{ts}] ❌ 未接続（接続待機中...）", end="", flush=True)
 
+                bssid_at_disconnect = prev_wifi.get("bssid", "").lower()
                 was_connected = False
 
             prev_wifi = wifi

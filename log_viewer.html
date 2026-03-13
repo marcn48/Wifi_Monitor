@@ -160,6 +160,10 @@
   .entry.reconnection  { border-left: 3px solid var(--green); }
   .entry.speedtest     { border-left: 3px solid #e3a008; }
   .entry.status        { border-left: 3px solid var(--border); }
+  .entry.roaming       { border-left: 3px solid var(--yellow); }
+  .entry.bss_scan      { border-left: 3px solid #58a6ff; }
+  .bss-ssid-row td     { font-weight: 500; background: rgba(255,255,255,0.04); padding-top: 8px; }
+  .bss-mine            { color: var(--yellow); font-weight: 500; }
 
   .entry-header { display: flex; align-items: center; gap: 10px; padding: 11px 16px; cursor: pointer; user-select: none; }
   .entry-header:hover { background: rgba(255,255,255,.02); }
@@ -233,8 +237,10 @@
     <button class="filter-btn active" data-filter="all">すべて</button>
     <button class="filter-btn" data-filter="disconnection">❌ 切断</button>
     <button class="filter-btn" data-filter="reconnection">🟢 再接続</button>
+    <button class="filter-btn" data-filter="roaming">🔀 ローミング</button>
     <button class="filter-btn" data-filter="status">📊 ステータス</button>
     <button class="filter-btn" data-filter="speedtest">📶 Speedtest</button>
+    <button class="filter-btn" data-filter="bss_scan">📡 BSSスキャン</button>
   </div>
 
   <div class="timeline" id="timeline">
@@ -250,13 +256,15 @@ let mainChart   = null;
 
 // データセット定義
 const DS_CONFIG = [
-  { key: 'signal',   label: '電波強度 (%)',       color: '#3fb950', yAxis: 'yPercent', defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseInt(e.wifi?.signal) || null },
-  { key: 'rx',       label: 'リンク速度Rx (Mbps)', color: '#58a6ff', yAxis: 'yMbps',   defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.rx_rate) || null },
-  { key: 'tx',       label: 'リンク速度Tx (Mbps)', color: '#a5d6ff', yAxis: 'yMbps',   defaultOn: false, dash: [4,3], pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.tx_rate) || null },
-  { key: 'download', label: 'DL実測 (Mbps)',       color: '#f0a030', yAxis: 'yMbps',   defaultOn: true,  dash: [6,3], pointR: 4,  src: 'speedtest', getValue: e => e.speedtest?.download_mbps || null },
-  { key: 'upload',   label: 'UL実測 (Mbps)',       color: '#bc8cff', yAxis: 'yMbps',   defaultOn: true,  dash: [4,4], pointR: 4,  src: 'speedtest', getValue: e => e.speedtest?.upload_mbps || null },
-  { key: 'ping',     label: 'Ping遅延 (ms)',        color: '#ff7b72', yAxis: 'yMs',     defaultOn: true,  dash: [3,3], pointR: 5,  src: 'speedtest', getValue: e => e.speedtest?.ping_ms || null },
-  { key: 'devices',  label: 'アクティブ機器数 (台)',  color: '#f0c060', yAxis: 'yDevices', defaultOn: true,  dash: [],    pointR: 2,  src: 'status',    getValue: e => e.active_devices || null },
+  { key: 'signal',       label: '電波強度 (%)',        color: '#3fb950', yAxis: 'yPercent', defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseInt(e.wifi?.signal) || null },
+  { key: 'rx',           label: 'リンク速度Rx (Mbps)', color: '#58a6ff', yAxis: 'yMbps',   defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.rx_rate) || null },
+  { key: 'tx',           label: 'リンク速度Tx (Mbps)', color: '#a5d6ff', yAxis: 'yMbps',   defaultOn: false, dash: [4,3], pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.tx_rate) || null },
+  { key: 'download',     label: 'DL実測 (Mbps)',        color: '#f0a030', yAxis: 'yMbps',   defaultOn: true,  dash: [6,3], pointR: 4,  src: 'speedtest', getValue: e => e.speedtest?.download_mbps || null },
+  { key: 'upload',       label: 'UL実測 (Mbps)',        color: '#bc8cff', yAxis: 'yMbps',   defaultOn: true,  dash: [4,4], pointR: 4,  src: 'speedtest', getValue: e => e.speedtest?.upload_mbps || null },
+  { key: 'ping',         label: 'Ping遅延 (ms)',         color: '#ff7b72', yAxis: 'yMs',     defaultOn: true,  dash: [3,3], pointR: 5,  src: 'speedtest', getValue: e => e.speedtest?.ping_ms || null },
+  { key: 'loss',         label: 'パケットロス (%)',      color: '#f85149', yAxis: 'yPercent', defaultOn: false, dash: [2,4], pointR: 4,  src: 'status',    getValue: e => e.packet_loss?.loss_pct ?? null },
+  { key: 'devices',      label: 'ARP機器数 (台)',         color: '#f0c060', yAxis: 'yDevices', defaultOn: true,  dash: [],    pointR: 2,  src: 'status',    getValue: e => e.active_devices || null },
+  { key: 'bss_stations', label: 'BSS接続台数 (台)',       color: '#79c0ff', yAxis: 'yDevices', defaultOn: false, dash: [2,2], pointR: 4,  src: 'bss',       getValue: e => e.bss_scan?.total_stations ?? null },
 ];
 
 // 各データセットの表示状態
@@ -298,6 +306,10 @@ function renderChart() {
     .filter(e => e.type === 'SPEEDTEST' && e.speedtest && !e.speedtest.error)
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
+  const bssEntries = allEntries
+    .filter(e => e.type === 'BSS_SCAN' && e.bss_scan)
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+
   if (statusEntries.length === 0) return;
 
   document.getElementById('chartCard').style.display = 'block';
@@ -312,13 +324,24 @@ function renderChart() {
     });
   }
 
+  // BSS系はstatusの時刻軸に最近傍マッピング（前後どちらか近い方）
+  function mapBssData(getFn) {
+    return statusEntries.map(e => {
+      if (!bssEntries.length) return null;
+      let best = bssEntries[0], bestDiff = Infinity;
+      for (const b of bssEntries) {
+        const diff = Math.abs(new Date(b.timestamp) - new Date(e.timestamp));
+        if (diff < bestDiff) { bestDiff = diff; best = b; }
+      }
+      return bestDiff < 40 * 60 * 1000 ? getFn(best) : null; // 40分以内なら使用
+    });
+  }
+
   const datasets = DS_CONFIG.map(cfg => {
     let data;
-    if (cfg.src === 'status') {
-      data = statusEntries.map(e => cfg.getValue(e));
-    } else {
-      data = mapSpeedData(cfg.getValue);
-    }
+    if (cfg.src === 'status')    data = statusEntries.map(e => cfg.getValue(e));
+    else if (cfg.src === 'bss')  data = mapBssData(cfg.getValue);
+    else                         data = mapSpeedData(cfg.getValue);
     return {
       label:          cfg.label,
       data,
@@ -367,7 +390,7 @@ function renderChart() {
           ticks: { color: '#3fb950', font: { family: 'IBM Plex Mono', size: 11 }, callback: v => v + '%' },
           grid: { color: '#21262d' },
           title: { display: true, text: '電波強度 (%)', color: '#3fb950', font: { size: 11 } },
-          display: dsVisible.signal,
+          display: dsVisible.signal || dsVisible.loss,
         },
         yMbps: {
           type: 'linear', position: 'right', min: 0,
@@ -388,7 +411,7 @@ function renderChart() {
           ticks: { color: '#f0c060', font: { family: 'IBM Plex Mono', size: 11 }, callback: v => v + ' 台' },
           grid: { drawOnChartArea: false },
           title: { display: true, text: '機器数 (台)', color: '#f0c060', font: { size: 11 } },
-          display: dsVisible.devices,
+          display: dsVisible.devices || dsVisible.bss_stations,
         },
       },
     },
@@ -413,10 +436,10 @@ function renderChart() {
       mainChart.data.datasets[idx].hidden = !dsVisible[key];
 
       // Y軸の表示/非表示を更新
-      mainChart.options.scales.yPercent.display  = dsVisible.signal;
+      mainChart.options.scales.yPercent.display  = dsVisible.signal || dsVisible.loss;
       mainChart.options.scales.yMbps.display    = dsVisible.rx || dsVisible.tx || dsVisible.download || dsVisible.upload;
       mainChart.options.scales.yMs.display      = dsVisible.ping;
-      mainChart.options.scales.yDevices.display = dsVisible.devices;
+      mainChart.options.scales.yDevices.display = dsVisible.devices || dsVisible.bss_stations;
 
       mainChart.update();
     });
@@ -429,10 +452,12 @@ function render() {
     ? allEntries
     : allEntries.filter(e => e.type && e.type.toLowerCase() === currentFilter);
 
-  const disc  = allEntries.filter(e => e.type === 'DISCONNECTION').length;
-  const rec   = allEntries.filter(e => e.type === 'RECONNECTION').length;
-  const stat  = allEntries.filter(e => e.type === 'STATUS').length;
-  const speed = allEntries.filter(e => e.type === 'SPEEDTEST').length;
+  const disc       = allEntries.filter(e => e.type === 'DISCONNECTION').length;
+  const rec        = allEntries.filter(e => e.type === 'RECONNECTION').length;
+  const roamAll    = allEntries.filter(e => e.type === 'ROAMING').length;
+  const roamViaDisc= allEntries.filter(e => e.type === 'ROAMING' && e.roaming_via === 'disconnect').length;
+  const stat       = allEntries.filter(e => e.type === 'STATUS').length;
+  const speed      = allEntries.filter(e => e.type === 'SPEEDTEST').length;
   const avgDl = (() => {
     const dls = allEntries.filter(e => e.type === 'SPEEDTEST' && e.speedtest?.download_mbps).map(e => e.speedtest.download_mbps);
     return dls.length ? Math.round(dls.reduce((a,b)=>a+b,0)/dls.length*10)/10 : null;
@@ -441,6 +466,11 @@ function render() {
     const sigs = allEntries.filter(e => e.wifi?.signal).map(e => parseInt(e.wifi.signal));
     return sigs.length ? Math.round(sigs.reduce((a,b)=>a+b,0)/sigs.length) : null;
   })();
+  const latestBss = (() => {
+    const bssList = allEntries.filter(e => e.type === 'BSS_SCAN' && e.bss_scan?.total_stations != null)
+      .sort((a,b) => b.timestamp.localeCompare(a.timestamp));
+    return bssList.length ? bssList[0].bss_scan.total_stations : null;
+  })();
 
   document.getElementById('statsArea').style.display = 'grid';
   document.getElementById('filterBar').style.display = 'flex';
@@ -448,6 +478,8 @@ function render() {
   document.getElementById('statsArea').innerHTML = `
     <div class="stat-card"><div class="label">切断回数</div><div class="value red">${disc}</div></div>
     <div class="stat-card"><div class="label">再接続回数</div><div class="value green">${rec}</div></div>
+    ${roamAll > 0 ? `<div class="stat-card"><div class="label">ローミング回数</div><div class="value yellow">${roamAll}<span style="font-size:11px;color:var(--text-dim);margin-left:6px">うち切断経由 ${roamViaDisc}</span></div></div>` : ''}
+    ${latestBss !== null ? `<div class="stat-card"><div class="label">エリア接続台数（最新）</div><div class="value" style="color:#58a6ff">${latestBss} 台</div></div>` : ''}
     <div class="stat-card"><div class="label">ステータス記録</div><div class="value">${stat}</div></div>
     ${avgSig !== null ? `<div class="stat-card"><div class="label">平均電波強度</div><div class="value ${avgSig<40?'red':avgSig<60?'yellow':'green'}">${avgSig}%</div></div>` : ''}
     ${speed > 0 ? `<div class="stat-card"><div class="label">Speedtest計測回数</div><div class="value">${speed}</div></div>` : ''}
@@ -469,6 +501,53 @@ function signalColor(s) {
   return '#f85149';
 }
 
+function bssScanHTML(bss, label) {
+  if (!bss || !bss.ssids) return '';
+  const cachedNote = bss.cached
+    ? ' <span style="color:#d29922;font-size:11px">⚠ キャッシュ使用（スキャン不完全）</span>' : '';
+  const tsNote = bss.timestamp
+    ? ` <span style="color:var(--text-dim);font-size:11px">${bss.timestamp.replace('T',' ').slice(0,16)} 取得</span>` : '';
+  let html = `<div class="section-title">BSSスキャン結果（${label}）— エリア全体 ${bss.total_stations} 台${cachedNote}${tsNote}</div>
+    <p style="font-size:11px;color:var(--text-dim);margin-bottom:6px">※ BSS台数=APが把握する実接続数 | ARP台数=自PC経由の推定値（別物）</p>
+    <table>
+      <tr><th>BSSID</th><th>帯域</th><th>Ch</th><th>接続台数</th><th>電波強度</th><th>Ch使用率</th></tr>`;
+  for (const s of bss.ssids) {
+    const sname = s.ssid ? s.ssid : `（名称なし / ${s.auth || '---'}）`;
+    html += `<tr class="bss-ssid-row"><td colspan="6">${sname} <span style="font-size:11px;font-weight:400;color:var(--text-dim)">合計 ${s.total} 台</span></td></tr>`;
+    for (const b of (s.bssids || [])) {
+      const sigPct  = b.signal ?? 0;
+      const sigColor = sigPct >= 70 ? '#3fb950' : sigPct >= 40 ? '#d29922' : '#f85149';
+      const mineTag    = b.is_mine ? '★ ' : '';
+      const mineSuffix = b.is_mine ? ' <span style="font-size:11px;font-weight:400">← 自分</span>' : '';
+      const util = b.ch_util_pct != null ? b.ch_util_pct : null;
+      const utilColor = util == null ? 'var(--text-dim)' : util >= 70 ? '#f85149' : util >= 40 ? '#d29922' : '#3fb950';
+      const utilStr = util != null
+        ? `<div style="display:flex;align-items:center;gap:4px">
+            <div style="width:40px;height:5px;background:var(--border);border-radius:2px;overflow:hidden">
+              <div style="width:${util}%;height:100%;background:${utilColor};border-radius:2px"></div>
+            </div>
+            <span style="font-size:11px;color:${utilColor}">${util}%</span>
+           </div>`
+        : '<span style="color:var(--text-dim);font-size:11px">---</span>';
+      html += `<tr>
+        <td class="${b.is_mine?'bss-mine':''}" style="font-family:var(--mono);font-size:12px">${mineTag}${b.bssid}${mineSuffix}</td>
+        <td>${b.band||'---'}</td>
+        <td>${b.channel||'---'} ch</td>
+        <td class="${b.is_mine?'bss-mine':''}">${b.stations} 台</td>
+        <td><div style="display:flex;align-items:center;gap:6px">
+          <div style="width:56px;height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+            <div style="width:${sigPct}%;height:100%;background:${sigColor};border-radius:3px"></div>
+          </div>
+          <span style="font-size:11px;color:${sigColor}">${sigPct}%</span>
+        </div></td>
+        <td>${utilStr}</td>
+      </tr>`;
+    }
+  }
+  html += '</table>';
+  return html;
+}
+
 function entryHTML(e, i) {
   const type = (e.type || '').toLowerCase();
   const ts   = e.timestamp ? e.timestamp.replace('T', ' ').slice(0, 19) : '';
@@ -477,11 +556,13 @@ function entryHTML(e, i) {
   const ssid = wifi.ssid || '---';
 
   let icon, label, badgeClass;
-  if (type === 'disconnection')     { icon='❌'; label='切断';       badgeClass='badge-red'; }
-  else if (type === 'reconnection') { icon='🟢'; label='再接続';     badgeClass='badge-green'; }
-  else if (type === 'speedtest')    { icon='📶'; label='Speedtest'; badgeClass='badge-yellow'; }
+  if (type === 'disconnection')     { icon='❌'; label='切断';        badgeClass='badge-red'; }
+  else if (type === 'reconnection') { icon='🟢'; label='再接続';      badgeClass='badge-green'; }
+  else if (type === 'roaming')      { icon='🔀'; label='ローミング';  badgeClass='badge-yellow'; }
+  else if (type === 'speedtest')    { icon='📶'; label='Speedtest';   badgeClass='badge-yellow'; }
   else if (type === 'wake')         { icon='💤'; label='スリープ復帰'; badgeClass='badge-blue'; }
-  else                              { icon='📊'; label='ステータス'; badgeClass='badge-blue'; }
+  else if (type === 'bss_scan')     { icon='📡'; label='BSSスキャン'; badgeClass='badge-blue'; }
+  else                              { icon='📊'; label='ステータス';  badgeClass='badge-blue'; }
 
   const sigBar = sig !== null ? `
     <div class="signal-bar-wrap">
@@ -493,10 +574,36 @@ function entryHTML(e, i) {
 
   const wifiTarget = type === 'disconnection' ? e.wifi_before : wifi;
   if (wifiTarget && Object.keys(wifiTarget).length) {
-    const rows = Object.entries(wifiTarget).map(([k,v]) =>
-      `<div class="wifi-row"><span class="wifi-key">${k}</span><span class="wifi-val">${v}</span></div>`
-    ).join('');
-    body += `<div class="section-title">Wi-Fi 状態${type==='disconnection'?' (切断直前)':''}</div><div class="wifi-grid">${rows}</div>`;
+    // rssi_source / rssi_dbm / snr_db / packet_loss はwifi-gridから除外して専用表示
+    const skipKeys = new Set(['rssi_source', 'rssi_dbm', 'snr_db']);
+    const rows = Object.entries(wifiTarget)
+      .filter(([k]) => !skipKeys.has(k))
+      .map(([k,v]) =>
+        `<div class="wifi-row"><span class="wifi-key">${k}</span><span class="wifi-val">${v}</span></div>`
+      ).join('');
+    let extra = '';
+    if (wifiTarget.rssi_dbm != null) {
+      const src = wifiTarget.rssi_source === 'wlanapi' ? '実測値' : '推定値';
+      const snrLabel = wifiTarget.rssi_source === 'wlanapi' ? '実測RSSI基準' : '推定';
+      extra += `<div class="wifi-row"><span class="wifi-key">rssi_dbm</span><span class="wifi-val">${wifiTarget.rssi_dbm} dBm（${src}）</span></div>`;
+      if (wifiTarget.snr_db != null)
+        extra += `<div class="wifi-row"><span class="wifi-key">snr_db</span><span class="wifi-val">${wifiTarget.snr_db} dB（${snrLabel}）</span></div>`;
+    }
+    body += `<div class="section-title">Wi-Fi 状態${type==='disconnection'?' (切断直前)':''}</div><div class="wifi-grid">${rows}${extra}</div>`;
+  }
+  // パケットロス（STATUSのみ）
+  if (type === 'status' && e.packet_loss != null) {
+    const pl = e.packet_loss;
+    const loss = pl.loss_pct ?? 100;
+    const lossIcon = loss === 0 ? '✅' : loss < 50 ? '⚠️' : '❌';
+    const lossColor = loss === 0 ? 'var(--green)' : loss < 50 ? 'var(--yellow)' : 'var(--red)';
+    const avgStr = pl.avg_ms != null ? `${pl.avg_ms} ms` : '---';
+    body += `<div class="section-title">パケットロス（GW宛 定期計測）</div>
+      <table>
+        <tr><th>項目</th><th>値</th></tr>
+        <tr><td>ロス率</td><td style="color:${lossColor}">${lossIcon} ${loss}%</td></tr>
+        <tr><td>平均遅延</td><td>${avgStr}</td></tr>
+      </table>`;
   }
 
   if (e.possible_causes?.length) {
@@ -536,6 +643,32 @@ function entryHTML(e, i) {
         <tr><th>項目</th><th>内容</th></tr>
         <tr><td>スリープ時間</td><td>${e.sleep_duration_sec ? Math.round(e.sleep_duration_sec/60) + ' 分' : '---'}</td></tr>
       </table>`;
+  }
+  // ローミング
+  if (type === 'roaming') {
+    const via = e.roaming_via === 'disconnect' ? '⚠ 切断経由（一時的に切断が発生）' : '✅ シームレス（切断なし）';
+    body += `<div class="section-title">ローミング情報</div>
+      <table>
+        <tr><th>項目</th><th>切替前</th><th>切替後</th></tr>
+        <tr><td>BSSID</td>
+            <td style="font-family:var(--mono);font-size:12px">${e.bssid_from||'---'}</td>
+            <td style="font-family:var(--mono);font-size:12px">${e.bssid_to||'---'}</td></tr>
+        <tr><td>チャネル</td><td>${e.channel_from||'---'} ch</td><td>${e.channel_to||'---'} ch</td></tr>
+      </table>
+      <p style="font-size:12px;margin-top:6px;color:${e.roaming_via==='disconnect'?'var(--yellow)':'var(--green)'}">${via}</p>`;
+    if (e.wifi && Object.keys(e.wifi).length) {
+      const rows = Object.entries(e.wifi).map(([k,v]) =>
+        `<div class="wifi-row"><span class="wifi-key">${k}</span><span class="wifi-val">${v}</span></div>`
+      ).join('');
+      body += `<div class="section-title">切替後の Wi-Fi 状態</div><div class="wifi-grid">${rows}</div>`;
+    }
+    if (e.bss_scan) body += bssScanHTML(e.bss_scan, 'ローミング後');
+  }
+
+  // BSSスキャン
+  if (type === 'bss_scan' && e.bss_scan) {
+    const triggerLabel = { startup:'起動時', periodic:'定期', roaming:'ローミング後' }[e.trigger] || e.trigger || '定期';
+    body += bssScanHTML(e.bss_scan, triggerLabel);
   }
 
   if (type === 'speedtest' && e.speedtest) {
@@ -581,7 +714,11 @@ function entryHTML(e, i) {
     <div class="entry-header">
       <span class="entry-time">${ts}</span>
       <span class="badge ${badgeClass}">${icon} ${label}</span>
-      <span class="entry-title">${type==='speedtest'?(e.speedtest&&!e.speedtest.error?`▼${e.speedtest.download_mbps}Mbps ▲${e.speedtest.upload_mbps}Mbps Ping:${e.speedtest.ping_ms}ms`:'エラー'):ssid}</span>
+      <span class="entry-title">${
+        type==='speedtest' ? (e.speedtest&&!e.speedtest.error?`▼${e.speedtest.download_mbps}Mbps ▲${e.speedtest.upload_mbps}Mbps Ping:${e.speedtest.ping_ms}ms`:'エラー') :
+        type==='bss_scan'  ? `エリア合計 ${e.bss_scan?.total_stations??'---'} 台 — ${{startup:'起動時',periodic:'定期',roaming:'ローミング後'}[e.trigger]||e.trigger||'定期'}` :
+        ssid
+      }</span>
       ${sigBar}
       ${body ? '<span class="chevron">▶</span>' : ''}
     </div>
