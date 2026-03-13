@@ -12,20 +12,71 @@ import json
 import re
 import sys
 import threading
+import ctypes
+import ctypes.wintypes as wt
+import urllib.request
 from pathlib import Path
 
 # ===================== 設定 =====================
 CHECK_INTERVAL    = 5     # 監視間隔（秒）
 PING_COUNT        = 4     # Ping送信回数
-LOG_DIR           = Path.home() / "WiFiMonitor" / "logs"
+LOG_DIR           = Path("C:/WiFiMonitor/logs")
 STATUS_LOG_EVERY  = 12    # N回に1回詳細表示＆ログ保存（60秒ごと）
 SPEEDTEST_EVERY   = 10    # N回の詳細表示ごとにSpeedtest実行（約10分ごと）
+LOCATION_EVERY    = 30    # N分ごとに位置情報を再取得（スリープ復帰後にも即更新）
+SLEEP_DETECT_SEC  = 30    # N秒以上ループが遅延したらスリープ復帰と判断
 # ================================================
 
 # Speedtest結果を保持するグローバル変数
 _speedtest_result  = None
 _speedtest_running = False
 _speedtest_lock    = threading.Lock()
+
+# 位置情報キャッシュ
+_location_cache = None
+_location_lock  = threading.Lock()
+
+
+def _setup_close_handler():
+    """コンソールウィンドウのWM_CLOSEをサブクラス化して×ボタンを制御する"""
+    WM_CLOSE        = 0x0010
+    GWL_WNDPROC     = -4
+    MB_YESNO        = 0x04
+    MB_ICONQUESTION = 0x20
+    IDYES           = 6
+
+    hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if not hwnd:
+        return
+
+    WNDPROCTYPE = ctypes.WINFUNCTYPE(
+        ctypes.c_longlong,
+        wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM
+    )
+
+    # オリジナルのウィンドウプロシージャを保存
+    original = ctypes.windll.user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
+
+    def custom_wndproc(h, msg, wp, lp):
+        if msg == WM_CLOSE:
+            result = ctypes.windll.user32.MessageBoxW(
+                h,
+                "Wi-Fi監視システムが終了します。\n本当に閉じますか？",
+                "Wi-Fi監視システム",
+                MB_YESNO | MB_ICONQUESTION,
+            )
+            if result == IDYES:
+                # 元のプロシージャを呼び出して正常終了
+                ctypes.windll.user32.CallWindowProcW(original, h, msg, wp, lp)
+                sys.exit(0)
+            return 0  # 閉じるをキャンセル（0を返すことでWM_CLOSEを無視）
+        return ctypes.windll.user32.CallWindowProcW(original, h, msg, wp, lp)
+
+    # GC防止のためグローバルに保持
+    _setup_close_handler._proc = WNDPROCTYPE(custom_wndproc)
+    ctypes.windll.user32.SetWindowLongPtrW(
+        hwnd, GWL_WNDPROC, _setup_close_handler._proc
+    )
 
 
 def run_cmd(cmd, timeout=15):
@@ -37,6 +88,23 @@ def run_cmd(cmd, timeout=15):
         return r.stdout
     except Exception:
         return ""
+
+
+NOISE_FLOOR_DBM = -95  # 推定ノイズフロア（dBm）
+
+
+def signal_to_rssi(signal_pct):
+    """
+    Windowsのsignal%(0-100)からRSSI(dBm)を逆算する。
+    Windows内部式: signal% = 2 * (RSSI + 100)  [-100≦RSSI≦-50]
+    逆算:          RSSI = signal% / 2 - 100
+    """
+    try:
+        s = int(str(signal_pct).replace('%', ''))
+        rssi = round(s / 2 - 100)
+        return rssi
+    except Exception:
+        return None
 
 
 def get_wifi_info():
@@ -57,7 +125,104 @@ def get_wifi_info():
         m = re.search(pat, out, re.MULTILINE)
         if m:
             info[key] = m.group(1).strip()
+
+    # RSSI / SNR を signal% から逆算
+    if "signal" in info:
+        rssi = signal_to_rssi(info["signal"])
+        if rssi is not None:
+            info["rssi_dbm"] = rssi
+            info["snr_db"]   = rssi - NOISE_FLOOR_DBM  # 推定SNR
+
     return info
+
+
+def get_location():
+    """Windows Location APIをPowerShell経由で取得し、逆ジオコーディングで住所を得る"""
+    try:
+        # PowerShellでWindows Location APIを呼び出す
+        ps = """
+Add-Type -AssemblyName System.Device
+$loc = New-Object System.Device.Location.GeoCoordinateWatcher
+$loc.Start()
+$timeout = 10
+$elapsed = 0
+while ($loc.Status -ne 'Ready' -and $elapsed -lt $timeout) {
+    Start-Sleep -Milliseconds 500
+    $elapsed += 0.5
+}
+$coord = $loc.Position.Location
+if ($coord.IsUnknown) {
+    Write-Output "UNKNOWN"
+} else {
+    Write-Output "$($coord.Latitude),$($coord.Longitude)"
+}
+$loc.Stop()
+"""
+        out = run_cmd(["powershell", "-Command", ps], timeout=20).strip()
+
+        if not out or out == "UNKNOWN" or "," not in out:
+            return None
+
+        parts = out.split(",")
+        lat = float(parts[0].strip())
+        lon = float(parts[1].strip())
+
+        # 逆ジオコーディング（nominatim）で住所を取得
+        try:
+            geo_url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&accept-language=ja"
+            req = urllib.request.Request(geo_url, headers={"User-Agent": "WiFiMonitor/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as res:
+                geo = json.loads(res.read().decode())
+            addr_parts = geo.get("address", {})
+            addr = " ".join(filter(None, [
+                addr_parts.get("country", ""),
+                addr_parts.get("province") or addr_parts.get("state", ""),
+                addr_parts.get("city") or addr_parts.get("town") or addr_parts.get("village", ""),
+                addr_parts.get("suburb") or addr_parts.get("neighbourhood", ""),
+            ]))
+        except Exception:
+            addr = f"{lat}, {lon}"
+
+        maps_url = f"https://www.google.com/maps?q={lat},{lon}"
+        return {
+            "address":  addr,
+            "lat":      round(lat, 6),
+            "lon":      round(lon, 6),
+            "maps_url": maps_url,
+        }
+
+    except Exception:
+        return None
+
+
+def update_location():
+    """バックグラウンドで位置情報を更新する"""
+    global _location_cache
+    loc = get_location()
+    with _location_lock:
+        if loc:
+            _location_cache = loc
+            _location_cache["updated_at"] = datetime.datetime.now().isoformat()
+
+
+def start_location_update():
+    t = threading.Thread(target=update_location, daemon=True)
+    t.start()
+
+
+def get_active_devices():
+    """ARPテーブルからアクティブな機器数を取得する"""
+    try:
+        out = run_cmd(["arp", "-a"])
+        # 動的エントリ（dynamic）のみカウント（静的・不完全なものを除外）
+        dynamic = [l for l in out.splitlines() if "dynamic" in l.lower() or "動的" in l.lower()]
+        if dynamic:
+            return len(dynamic)
+        # dynamicの表記がない環境用フォールバック（IPアドレス行をカウント）
+        ip_lines = [l for l in out.splitlines() if re.search(r'\d+\.\d+\.\d+\.\d+', l) and "インターフェイス" not in l and "Interface" not in l and "アドレス" not in l and "Address" not in l]
+        return len(ip_lines)
+    except Exception:
+        return None
 
 
 def get_gateway():
@@ -240,7 +405,7 @@ def signal_bar(val):
     return f"{bar} {n}%"
 
 
-def print_detail(ts, wifi, gateway, start_dt, detail_count):
+def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None):
     """詳細ステータスを画面に表示"""
     elapsed = datetime.datetime.now() - start_dt
     h, rem  = divmod(int(elapsed.total_seconds()), 3600)
@@ -256,6 +421,14 @@ def print_detail(ts, wifi, gateway, start_dt, detail_count):
     print(f"  監視開始    : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  経過時間    : {h:02d}:{m:02d}:{s:02d}")
     print(f"  ゲートウェイ: {gateway}")
+    dev_str = f"{active_devices} 台（ARPテーブル）" if active_devices is not None else "---"
+    print(f"  アクティブ機器: {dev_str}")
+    with _location_lock:
+        loc = _location_cache
+    if loc:
+        print(f"  現在地      : {loc.get('address', '---')}")
+        print(f"  緯度経度    : {loc.get('lat', '---')}, {loc.get('lon', '---')}")
+        print(f"  Googleマップ: {loc.get('maps_url', '---')}")
     sep("-")
     print(f"  SSID        : {wifi.get('ssid', '---')}")
     print(f"  電波強度    : {signal_bar(wifi.get('signal', '---'))}")
@@ -265,6 +438,9 @@ def print_detail(ts, wifi, gateway, start_dt, detail_count):
     print(f"  送信速度(L) : {wifi.get('tx_rate', '---')} Mbps  ← リンク速度")
     print(f"  BSSID       : {wifi.get('bssid', '---')}")
     print(f"  認証方式    : {wifi.get('auth', '---')}")
+    if wifi.get('rssi_dbm') is not None:
+        print(f"  RSSI        : {wifi.get('rssi_dbm')} dBm")
+        print(f"  SNR (推定)  : {wifi.get('snr_db')} dB")
     sep("-")
 
     # Speedtest結果表示
@@ -290,6 +466,8 @@ def print_detail(ts, wifi, gateway, start_dt, detail_count):
 def run_monitor():
     global _speedtest_result
 
+    _setup_close_handler()  # ×ボタン確認ポップアップを有効化
+
     start_dt     = datetime.datetime.now()
     detail_count = 0   # 詳細表示の回数カウント
 
@@ -312,21 +490,49 @@ def run_monitor():
         print(f"  %LocalAppData%\\Programs\\Python\\Python314\\python.exe -m pip install speedtest-cli\n")
 
     gateway   = get_gateway()
-    print(f"  デフォルトゲートウェイ: {gateway}\n")
+    print(f"  デフォルトゲートウェイ: {gateway}")
 
-    prev_wifi     = {}
-    was_connected = None
-    loop_count    = 0
+    # 起動時に位置情報を取得
+    print("  📍 位置情報を取得中...")
+    start_location_update()
+    print()
+
+    prev_wifi          = {}
+    was_connected      = None
+    loop_count         = 0
+    last_loop_time     = datetime.datetime.now()
+    last_location_time = datetime.datetime.now()
 
     # 起動時に最初のSpeedtestを実行
     start_speedtest()
 
     while True:
         try:
+            now = datetime.datetime.now()
+
+            # スリープ復帰検知
+            elapsed_since_last = (now - last_loop_time).total_seconds()
+            if elapsed_since_last > SLEEP_DETECT_SEC:
+                ts_wake = now.strftime("%H:%M:%S")
+                print(f"\n\n[{ts_wake}] 💤 スリープ復帰を検知しました。位置情報を更新中...")
+                start_location_update()
+                last_location_time = now
+                save_log({
+                    "timestamp": now.isoformat(),
+                    "type":      "WAKE",
+                    "sleep_duration_sec": round(elapsed_since_last),
+                })
+            last_loop_time = now
+
+            # 定期的な位置情報更新
+            if (now - last_location_time).total_seconds() >= LOCATION_EVERY * 60:
+                start_location_update()
+                last_location_time = now
+
             wifi = get_wifi_info()
             state_val    = wifi.get("state", "").strip()
             is_connected = state_val in ("connected", "接続済み", "接続", "接続されました")
-            ts           = datetime.datetime.now().strftime("%H:%M:%S")
+            ts           = now.strftime("%H:%M:%S")
 
             # ---- 接続中 ----
             if is_connected:
@@ -340,12 +546,17 @@ def run_monitor():
                 if loop_count % STATUS_LOG_EVERY == 0:
                     with _speedtest_lock:
                         sp = _speedtest_result
-                    print_detail(ts, wifi, gateway, start_dt, detail_count)
+                    active_devices = get_active_devices()
+                    print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices)
+                    with _location_lock:
+                        loc = _location_cache
                     save_log({
-                        "timestamp": datetime.datetime.now().isoformat(),
-                        "type":      "STATUS",
-                        "wifi":      wifi,
-                        "speedtest": sp,
+                        "timestamp":      datetime.datetime.now().isoformat(),
+                        "type":           "STATUS",
+                        "wifi":           wifi,
+                        "speedtest":      sp,
+                        "active_devices": active_devices,
+                        "location":       loc,
                     })
 
                     # Speedtest定期実行
