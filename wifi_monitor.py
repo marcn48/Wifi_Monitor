@@ -22,7 +22,7 @@ CHECK_INTERVAL    = 5     # 監視間隔（秒）
 PING_COUNT        = 4     # Ping送信回数
 LOG_DIR           = Path("C:/WiFiMonitor/logs")
 STATUS_LOG_EVERY  = 12    # N回に1回詳細表示＆ログ保存（60秒ごと）
-SPEEDTEST_EVERY   = 10    # N回の詳細表示ごとにSpeedtest実行（約10分ごと）
+SPEEDTEST_EVERY   = 30    # N回の詳細表示ごとにSpeedtest実行（約30分ごと）
 LOCATION_EVERY    = 30    # N分ごとに位置情報を再取得（スリープ復帰後にも即更新）
 SLEEP_DETECT_SEC  = 30    # N秒以上ループが遅延したらスリープ復帰と判断
 # ================================================
