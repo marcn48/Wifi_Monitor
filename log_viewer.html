@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Wi-Fi 監視ログビューア</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+JP:wght@400;500;600&display=swap');
 
@@ -23,7 +25,7 @@
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { background: var(--bg); color: var(--text); font-family: var(--sans); min-height: 100vh; }
+  body { background: var(--bg); color: var(--text); font-family: var(--sans); min-height: 100vh; overflow: hidden; }
 
   header {
     background: var(--surface);
@@ -35,16 +37,111 @@
     position: sticky;
     top: 0;
     z-index: 100;
+    height: 48px;
+    flex-shrink: 0;
   }
   header h1 { font-size: 16px; font-weight: 600; letter-spacing: .04em; color: var(--accent); }
+
+  /* ── Layout shell ── */
+  .app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+  .dashboard {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 380px;
+    gap: 16px;
+    padding: 16px 24px;
+    overflow-y: auto;
+    min-height: 200px;
+  }
+  .dash-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  .dash-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+
+  @media (max-width: 1100px) {
+    .dashboard { grid-template-columns: 1fr; }
+    .dash-side { order: -1; }
+  }
+
+  /* ── Docked Log Panel ── */
+  .dock-panel {
+    display: none;
+    flex-direction: column;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    min-height: 0;
+    height: 260px;
+    flex-shrink: 0;
+  }
+  .dock-panel.open {
+    display: flex;
+  }
+  .dock-divider {
+    height: 6px;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    cursor: ns-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    user-select: none;
+    transition: background .15s;
+  }
+  .dock-divider:hover, .dock-divider.dragging {
+    background: var(--accent);
+    opacity: .4;
+  }
+  .dock-divider-bar {
+    width: 40px;
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+  }
+  .dock-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .dock-header h2 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .dock-toggle {
+    margin-left: auto;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all .15s;
+  }
+  .dock-toggle:hover { border-color: var(--accent); color: var(--text); }
+  .dock-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px 16px;
+    min-height: 0;
+  }
 
   .badge { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 20px; font-weight: 600; }
   .badge-green  { background: #1a3a20; color: var(--green); }
   .badge-red    { background: #3a1a1a; color: var(--red); }
   .badge-yellow { background: #3a2e10; color: var(--yellow); }
   .badge-blue   { background: #1a2a3a; color: var(--accent); }
-
-  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
 
   /* Compact dropzone */
   .dropzone {
@@ -56,7 +153,6 @@
     gap: 14px;
     cursor: pointer;
     transition: border-color .2s, background .2s;
-    margin-bottom: 20px;
   }
   .dropzone:hover, .dropzone.drag { border-color: var(--accent); background: #0d1f33; }
   .dropzone .icon { font-size: 24px; flex-shrink: 0; }
@@ -70,7 +166,6 @@
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 20px 24px;
-    margin-bottom: 20px;
     display: none;
   }
   .chart-card-header {
@@ -127,25 +222,66 @@
 
   .chart-wrap { position: relative; height: 320px; }
 
+  /* Zoom controls */
+  .chart-zoom-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+  }
+  .chart-zoom-bar .zoom-hint {
+    font-size: 11px;
+    color: var(--muted);
+    margin-right: auto;
+  }
+  .zoom-btn {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 4px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: var(--sans);
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .zoom-btn:hover { border-color: var(--accent); color: var(--text); }
+
   /* Stats */
   .stats {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 10px;
-    margin-bottom: 20px;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 8px;
+    overflow: visible;
   }
-  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px; }
-  .stat-card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
-  .stat-card .value { font-family: var(--mono); font-size: 26px; font-weight: 600; line-height: 1; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px; position: relative; overflow: visible; }
+  .stat-card:hover { z-index: 20; }
+  .stat-card .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 4px; display: flex; align-items: center; gap: 2px; }
+  .stat-card .value { font-family: var(--mono); font-size: 22px; font-weight: 600; line-height: 1; }
   .stat-card .value.red    { color: var(--red); }
   .stat-card .value.green  { color: var(--green); }
   .stat-card .value.yellow { color: var(--yellow); }
 
+  /* Quality diagnosis */
+  .quality-grid { display: grid; grid-template-columns: auto 1fr auto auto; gap: 4px 10px; align-items: center; font-size: 13px; margin: 8px 0; }
+  .quality-layer-name { color: var(--muted); white-space: nowrap; }
+  .quality-bar-wrap { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; min-width: 100px; }
+  .quality-bar-fill { height: 100%; border-radius: 4px; transition: width .3s; }
+  .quality-pct { font-family: var(--mono); font-size: 12px; min-width: 36px; text-align: right; }
+  .quality-detail { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .quality-overall { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 8px 12px; background: rgba(255,255,255,.02); border-radius: 8px; }
+  .quality-overall .q-icon { font-size: 18px; }
+  .quality-overall .q-label { font-size: 14px; font-weight: 600; }
+  .quality-overall .q-bn { font-size: 12px; color: var(--muted); margin-left: auto; }
+  .quality-message { font-size: 12px; color: var(--yellow); margin-top: 8px; padding: 6px 10px; background: #3a2e10; border: 1px solid #5a4a20; border-radius: 6px; }
+  .quality-badge { font-family: var(--mono); font-size: 10px; padding: 1px 7px; border-radius: 10px; font-weight: 600; margin-left: 6px; }
+
   /* Filter bar */
-  .filter-bar { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .filter-bar { display: flex; gap: 6px; flex-wrap: wrap; padding: 6px 16px; flex-shrink: 0; }
   .filter-btn {
     background: var(--surface); border: 1px solid var(--border); color: var(--muted);
-    padding: 5px 14px; border-radius: 20px; font-size: 13px; cursor: pointer;
+    padding: 4px 10px; border-radius: 20px; font-size: 12px; cursor: pointer;
     transition: all .15s; font-family: var(--sans);
   }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
@@ -196,43 +332,343 @@
   .wifi-key { color: var(--muted); min-width: 90px; }
   .wifi-val { font-family: var(--mono); }
 
-  .empty-state { text-align: center; padding: 64px; color: var(--muted); }
+  .empty-state { text-align: center; padding: 32px; color: var(--muted); font-size: 13px; }
+
+  /* Dock trigger button (in dashboard) */
+  .dock-trigger {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--muted);
+    font-size: 13px;
+    font-family: var(--sans);
+    cursor: pointer;
+    transition: all .15s;
+    width: 100%;
+  }
+  .dock-trigger:hover { border-color: var(--accent); color: var(--text); }
+  .dock-trigger .count-badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: #1a2a3a;
+    color: var(--accent);
+  }
+
+  /* ── Chart↔Log cross-link highlight ── */
+  .entry.highlight {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 1px var(--accent), 0 0 12px rgba(88,166,255,.25);
+    transition: box-shadow .3s, border-color .3s;
+  }
+  .entry.highlight .entry-header {
+    background: rgba(88,166,255,.06);
+  }
+
+  /* Glossary hint tooltips */
+  .hint { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; background: rgba(88,166,255,.12); color: var(--accent); font-size: 9px; font-weight: 700; cursor: help; position: relative; vertical-align: middle; margin-left: 3px; flex-shrink: 0; line-height: 1; user-select: none; }
+  .hint:hover { background: rgba(88,166,255,.25); }
+  .hint::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); background: #1c2128; color: var(--text); font-size: 12px; font-weight: 400; font-family: var(--sans); padding: 8px 12px; border-radius: 8px; border: 1px solid var(--border); white-space: normal; width: max-content; max-width: 260px; line-height: 1.55; pointer-events: none; opacity: 0; transition: opacity .15s; z-index: 100; box-shadow: 0 4px 16px rgba(0,0,0,.4); text-align: left; }
+  .hint:hover::after { opacity: 1; }
+  .hint-right::after { left: auto; right: 0; transform: none; }
+  .hint-left::after { left: 0; transform: none; }
+  /* SVG hint icon */
+  .nm-hint { cursor: help; }
+  .nm-hint-tip { pointer-events: none; opacity: 0; transition: opacity .15s; }
+  .nm-hint:hover + .nm-hint-tip, .nm-hint:hover ~ .nm-hint-tip { opacity: 1; }
 
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  /* ── Network Diagnosis Visualization ── */
+  .netdiag-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    display: none;
+    overflow: hidden;
+  }
+  .netdiag-section-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    margin-bottom: 14px;
+  }
+  .netdiag-section-title:not(:first-of-type) { margin-top: 28px; }
+
+  /* Network Path Map (SVG) */
+  .net-map { position: relative; width: 100%; padding: 10px 0 6px; }
+  .net-map svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .net-map svg text { font-family: var(--sans); }
+  .net-map svg .nm-mono { font-family: var(--mono); letter-spacing: .04em; }
+  @keyframes flowDash  { to { stroke-dashoffset: -24; } }
+  @keyframes flowDash2 { to { stroke-dashoffset: -31; } }
+  @keyframes flowDash3 { to { stroke-dashoffset: -41; } }
+  @keyframes pulse-glow-node {
+    0%,100% { filter: drop-shadow(0 0 4px rgba(248,81,73,.3)); }
+    50%     { filter: drop-shadow(0 0 14px rgba(248,81,73,.7)); }
+  }
+  .nm-flow  { animation: flowDash  2.2s linear infinite; }
+  .nm-flow2 { animation: flowDash2 3.4s linear infinite; }
+  .nm-flow3 { animation: flowDash3 4.8s linear infinite; }
+  .nm-bn-node { animation: pulse-glow-node 2s ease-in-out infinite; }
+
+  /* Health Timeline */
+  .ht-wrap { position: relative; height: 160px; border-radius: 8px; overflow: hidden; }
+  .ht-wrap canvas { display: block; width: 100% !important; height: 100% !important; }
+  .ht-controls { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .ht-controls .zoom-hint { font-size: 11px; color: var(--muted); margin-right: auto; }
+  .ht-toggles { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .ht-legend { display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .ht-legend-item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); cursor: default; }
+  .ht-swatch { width: 14px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+  .ht-legend-zones { margin-top: 2px; opacity: .7; }
+  .ht-legend-zones .ht-swatch { width: 10px; height: 10px; border-radius: 2px; }
+  .ht-bn-dot { width: 8px; height: 8px; border-radius: 50%; background: #f85149; flex-shrink: 0; }
+
+  /* Bottleneck frequency */
+  .bn-chart { margin-top: 8px; }
+  .bn-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; min-width: 0; }
+  .bn-name { font-size: 12px; min-width: 100px; width: 100px; flex-shrink: 0; white-space: nowrap; }
+  .bn-bar-wrap { flex: 0 1 300px; height: 14px; background: var(--border); border-radius: 7px; overflow: hidden; }
+  .bn-bar-fill { height: 100%; border-radius: 7px; transition: width .5s; }
+  .bn-count { font-family: var(--mono); font-size: 12px; color: var(--muted); min-width: 80px; flex-shrink: 0; }
+
+  /* ── AP Mobility / Tethering Analysis ── */
+  .mob-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    display: none;
+    overflow: hidden;
+  }
+  .mob-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .mob-header h2 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .08em;
+  }
+  .mob-type-badge {
+    font-size: 12px;
+    padding: 3px 12px;
+    border-radius: 20px;
+    font-weight: 600;
+    font-family: var(--mono);
+  }
+  .mob-type-tether { background: #2d1f3a; color: #bc8cff; border: 1px solid #4a2d6a; }
+  .mob-type-fixed  { background: #1a2a3a; color: var(--accent); border: 1px solid #2a3a5a; }
+
+  .mob-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .mob-metric {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+  }
+  .mob-metric .mm-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 4px; }
+  .mob-metric .mm-val { font-family: var(--mono); font-size: 20px; font-weight: 600; line-height: 1.2; }
+  .mob-metric .mm-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+  /* Distance gauge */
+  .dist-gauge {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 0;
+  }
+  .dist-gauge-track {
+    flex: 1;
+    height: 10px;
+    background: var(--border);
+    border-radius: 5px;
+    position: relative;
+    overflow: visible;
+  }
+  .dist-gauge-zones {
+    position: absolute;
+    inset: 0;
+    border-radius: 5px;
+    overflow: hidden;
+    display: flex;
+  }
+  .dist-zone { height: 100%; }
+  .dist-gauge-marker {
+    position: absolute;
+    top: 50%;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--text);
+    border: 2px solid var(--bg);
+    transform: translate(-50%, -50%);
+    z-index: 2;
+    transition: left .5s;
+  }
+  .dist-gauge-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--muted);
+    font-family: var(--mono);
+    margin-top: 4px;
+  }
+  .dist-label { text-align: center; }
+  .dist-label-val { font-size: 12px; font-weight: 600; }
+
+  /* Rapid drop events */
+  .mob-drops { margin-top: 6px; }
+  .mob-drop-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    background: #3a1a1a;
+    border: 1px solid #5a2020;
+    border-radius: 6px;
+    font-size: 12px;
+    margin-bottom: 4px;
+    color: #ffaaaa;
+  }
+  .mob-drop-item .drop-time { font-family: var(--mono); color: var(--muted); min-width: 48px; }
+  .mob-drop-item .drop-arrow { font-size: 14px; }
+
+  /* Signal sparkline */
+  .mob-spark-wrap {
+    position: relative;
+    height: 80px;
+    margin-top: 8px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .mob-spark-wrap canvas { display: block; width: 100%; height: 100%; }
+  .mob-spark-overlay {
+    position: absolute;
+    top: 4px;
+    right: 8px;
+    font-size: 10px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+
+  .mob-note {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 12px;
+    padding: 8px 12px;
+    background: rgba(255,255,255,.02);
+    border-radius: 6px;
+    border-left: 3px solid var(--accent);
+    line-height: 1.6;
+  }
 </style>
 </head>
 <body>
+
+<div class="app-shell">
 
 <header>
   <h1>📡 Wi-Fi 監視ログビューア</h1>
   <span id="headerStatus" class="badge badge-blue">ファイル未読込</span>
 </header>
 
-<div class="container">
+<div class="dashboard" id="dashboard">
 
-  <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
-    <div class="icon">📂</div>
-    <p>
-      <strong>ログファイルをドラッグ＆ドロップ</strong>　または クリックして選択<br>
-      <span style="font-size:11px;">保存先: ユーザーフォルダ ▶ WiFiMonitor ▶ logs ▶ wifi_log_YYYY-MM-DD.json</span>
-    </p>
-    <input type="file" id="fileInput" accept=".json">
+  <!-- Left main column -->
+  <div class="dash-main">
+    <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+      <div class="icon">📂</div>
+      <p>
+        <strong>ログファイルをドラッグ＆ドロップ</strong>　または クリックして選択<br>
+        <span style="font-size:11px;">保存先: ユーザーフォルダ ▶ WiFiMonitor ▶ logs ▶ wifi_log_YYYY-MM-DD.json</span>
+      </p>
+      <input type="file" id="fileInput" accept=".json">
+    </div>
+
+    <div class="chart-card" id="chartCard">
+      <div class="chart-card-header">
+        <h2>📈 時系列グラフ</h2>
+        <div class="ds-toggles" id="dsToggles"></div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="mainChart"></canvas>
+      </div>
+      <div class="chart-zoom-bar">
+        <span class="zoom-hint">🔍 ドラッグで範囲ズーム · ホイールでズーム · Ctrl+ドラッグでスクロール · クリックでログへジャンプ</span>
+        <button class="zoom-btn" id="zoomResetBtn" onclick="if(mainChart){mainChart.resetZoom();}">&#x21ba; リセット</button>
+      </div>
+    </div>
+
+    <div class="netdiag-card" id="netDiagCard">
+      <h2 class="netdiag-section-title">🔍 ネットワーク経路マップ</h2>
+      <div id="pathDiagram"></div>
+      <h2 class="netdiag-section-title">� レイヤースコア推移</h2>
+      <div id="healthHeatmap"></div>
+      <h2 class="netdiag-section-title">🔥 ボトルネック頻度</h2>
+      <div id="bnFrequency"></div>
+    </div>
+
+    <!-- Dock trigger button -->
+    <button class="dock-trigger" id="dockTrigger" onclick="toggleDock(true)">
+      📋 ログ一覧を開く <span class="count-badge" id="logCountBadge">0</span>
+    </button>
   </div>
 
-  <div class="chart-card" id="chartCard">
-    <div class="chart-card-header">
-      <h2>📈 時系列グラフ</h2>
-      <div class="ds-toggles" id="dsToggles"></div>
-    </div>
-    <div class="chart-wrap">
-      <canvas id="mainChart"></canvas>
+  <!-- Right sidebar -->
+  <div class="dash-side">
+    <div id="statsArea" class="stats" style="display:none"></div>
+
+    <div class="mob-card" id="mobCard">
+      <div class="mob-header">
+        <h2>📱 接続環境分析</h2>
+        <span id="mobTypeBadge" class="mob-type-badge"></span>
+      </div>
+      <div id="mobSummary" class="mob-summary"></div>
+      <div id="mobDistGauge"></div>
+      <div id="mobSparkline"></div>
+      <div id="mobDrops"></div>
+      <div id="mobNote"></div>
     </div>
   </div>
 
-  <div id="statsArea" class="stats" style="display:none"></div>
+</div><!-- /dashboard -->
 
+<!-- Docked Log Panel -->
+<div class="dock-divider" id="dockDivider">
+  <div class="dock-divider-bar"></div>
+</div>
+<div class="dock-panel" id="dockPanel">
+  <div class="dock-header">
+    <h2>📋 ログ一覧</h2>
+    <span style="font-size:10px;color:var(--muted);opacity:.7" title="ログエントリをダブルクリックでグラフの該当位置へジャンプ">⇄ グラフ連動</span>
+    <span id="dockCount" style="font-size:12px;color:var(--muted)"></span>
+    <button class="dock-toggle" onclick="toggleDock(false)" title="ログパネルを閉じる">✕</button>
+  </div>
   <div class="filter-bar" id="filterBar" style="display:none">
     <button class="filter-btn active" data-filter="all">すべて</button>
     <button class="filter-btn" data-filter="disconnection">❌ 切断</button>
@@ -242,29 +678,143 @@
     <button class="filter-btn" data-filter="speedtest">📶 Speedtest</button>
     <button class="filter-btn" data-filter="bss_scan">📡 BSSスキャン</button>
   </div>
-
-  <div class="timeline" id="timeline">
-    <div class="empty-state">ログファイルを読み込んでください</div>
+  <div class="dock-body">
+    <div class="timeline" id="timeline">
+      <div class="empty-state">ログファイルを読み込んでください</div>
+    </div>
   </div>
-
 </div>
 
+</div><!-- /app-shell -->
+
 <script>
+// --- ヒントツールチップの画面端補正（親要素基準・absolute方式） ---
+document.addEventListener('DOMContentLoaded', () => {
+  function adjustHintTooltip(e) {
+    const hint = e.currentTarget;
+    let popup = hint._popup;
+    if (!popup) {
+      popup = document.createElement('div');
+      popup.className = 'tip-popup';
+      popup.textContent = hint.getAttribute('data-tip');
+      popup.style.position = 'absolute';
+      popup.style.zIndex = 99;
+      popup.style.background = '#1c2128';
+      popup.style.color = '#c9d1d9';
+      popup.style.fontSize = '12px';
+      popup.style.fontFamily = 'IBM Plex Sans JP, sans-serif';
+      popup.style.padding = '8px 12px';
+      popup.style.borderRadius = '8px';
+      popup.style.border = '1px solid #21262d';
+      popup.style.boxShadow = '0 4px 16px rgba(0,0,0,.4)';
+      popup.style.whiteSpace = 'normal';
+      popup.style.maxWidth = '260px';
+      popup.style.lineHeight = '1.55';
+      popup.style.display = 'none';
+      hint.insertAdjacentElement('afterend', popup);
+      hint._popup = popup;
+    }
+    popup.textContent = hint.getAttribute('data-tip');
+    popup.style.display = 'block';
+    // 親要素をrelative化
+    const parent = hint.offsetParent;
+    if (parent && getComputedStyle(parent).position === 'static') {
+      parent.style.position = 'relative';
+    }
+    // 位置計算
+    const hintRect = hint.getBoundingClientRect();
+    const parentRect = parent ? parent.getBoundingClientRect() : {left:0,top:0};
+    const pw = popup.offsetWidth || 260;
+    const ph = popup.offsetHeight || 40;
+    let left = hint.offsetLeft + hint.offsetWidth/2 - pw/2;
+    let top = hint.offsetTop - ph - 8;
+    // 端補正（親要素内）
+    if (left < 0) left = 0;
+    if (left + pw > parent.offsetWidth) left = parent.offsetWidth - pw;
+    if (top < 0) top = hint.offsetTop + hint.offsetHeight + 8;
+    popup.style.left = left + 'px';
+    popup.style.top = top + 'px';
+    popup.style.opacity = 1;
+  }
+  function hideHintTooltip(e) {
+    const hint = e.currentTarget;
+    if (hint._popup) {
+      hint._popup.style.display = 'none';
+    }
+  }
+  document.body.addEventListener('mouseover', e => {
+    if (e.target.classList.contains('hint')) adjustHintTooltip(e);
+  }, true);
+  document.body.addEventListener('mouseout', e => {
+    if (e.target.classList.contains('hint')) hideHintTooltip(e);
+  }, true);
+});
 let allEntries  = [];
 let currentFilter = 'all';
 let mainChart   = null;
+let healthTLChart = null;
+
+// ---- Glossary (beginner-friendly tooltips) ----
+const GLOSSARY = {
+  // Network layers
+  'wifi':       'PCとルーター間の無線（Wi-Fi）接続の品質。電波が弱いと速度低下や切断の原因になります',
+  'router':     'PCの通信をインターネットへ中継する装置。家庭や会社に設置されています',
+  'internet':   'ルーターから先のインターネット回線の品質。プロバイダや回線混雑が影響します',
+  'dns':        '「google.com」などの名前をIPアドレスに変換する仕組み。遅いとページ表示が遅くなります',
+  'speed':      '実際にデータを送受信したときの速度。回線速度とは別に、混雑状況で変わります',
+  // Chart metrics
+  'signal':     '電波の強さ（%）。高いほどWi-Fi接続が安定します。70%以上が理想的です',
+  'rx':         'ルーターからPCへデータを受け取る最大リンク速度（理論値）',
+  'tx':         'PCからルーターへデータを送る最大リンク速度（理論値）',
+  'download':   '実際にインターネットからデータをダウンロードした速度（Speedtest計測値）',
+  'upload':     '実際にインターネットへデータをアップロードした速度（Speedtest計測値）',
+  'ping':       'サーバーにデータを送って返ってくるまでの時間。小さいほど快適です',
+  'loss':       '送ったデータが届かなかった割合。0%が正常で、高いと通信が不安定です',
+  'devices':    '同じネットワーク内で通信中の機器数（ARP検出）。多いと回線が混雑します',
+  'bss_stations':'同じアクセスポイントに接続中の端末数。多いとWi-Fiが混雑します',
+  // Stats cards
+  'disconnection':  'Wi-Fiが切れた回数。頻繁に起きる場合は電波環境を確認してください',
+  'reconnection':   '切断後にWi-Fiへ再接続した回数',
+  'roaming':        '接続先のアクセスポイントが自動的に切り替わった回数。複数APがある環境で起きます',
+  'area_devices':   '同じWi-Fiエリア内にいる機器の台数（最新のスキャン結果）',
+  'avg_signal':     '記録期間中の電波強度の平均値。60%以上が望ましいです',
+  'avg_quality':    '全レイヤーを総合した接続品質スコア。70%以上なら良好です',
+  'avg_download':   'Speedtest実測ダウンロード速度の平均',
+  'speedtest_count':'速度テスト（Speedtest）を実行した回数',
+  'status_count':   '定期的に記録された接続状態の件数',
+  // Mobility
+  'stability':      '電波強度の安定度。振れ幅が小さいほど安定です',
+  'signal_range':   '電波強度の最小〜最大の範囲。差が大きいと不安定です',
+  'est_distance':   '電波強度から推定したPCとアクセスポイント間の距離',
+  'rapid_drop':     '電波が急に弱くなったイベント。AP から離れたか障害物が原因の可能性',
+  'tethering':      'スマホなどを経由してインターネットに接続する方法',
+  // Log entries
+  'packet_loss':    'ルーターへ送ったデータが途中で消失する現象。ネットワーク負荷や電波干渉が原因',
+  'bottleneck':     '通信の中で一番遅い（問題のある）箇所。ここを改善すると全体が速くなります',
+  'bss_scan':       '周辺のWi-Fiアクセスポイントを一覧取得するスキャン',
+  'snr':            '電波信号とノイズの比率（Signal-to-Noise Ratio）。高いほど通信品質が良い',
+  'ch_util':        'Wi-Fiチャネルの混雑度。高いと他のWi-Fiと電波が干渉しています',
+  'rssi':           '受信信号強度（dBm）。-30が最強、-90が最弱。-65以上なら良好です',
+};
+function hint(key, align) {
+  const tip = GLOSSARY[key];
+  if (!tip) return '';
+  // hint-right/hint-leftは今後の拡張用だが、JSで位置補正するのでclassはそのまま
+  const cls = align === 'right' ? ' hint-right' : align === 'left' ? ' hint-left' : '';
+  return `<span class="hint${cls}" data-tip="${tip}">?</span>`;
+}
 
 // データセット定義
 const DS_CONFIG = [
-  { key: 'signal',       label: '電波強度 (%)',        color: '#3fb950', yAxis: 'yPercent', defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseInt(e.wifi?.signal) || null },
-  { key: 'rx',           label: 'リンク速度Rx (Mbps)', color: '#58a6ff', yAxis: 'yMbps',   defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.rx_rate) || null },
-  { key: 'tx',           label: 'リンク速度Tx (Mbps)', color: '#a5d6ff', yAxis: 'yMbps',   defaultOn: false, dash: [4,3], pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.tx_rate) || null },
-  { key: 'download',     label: 'DL実測 (Mbps)',        color: '#f0a030', yAxis: 'yMbps',   defaultOn: true,  dash: [6,3], pointR: 4,  src: 'speedtest', getValue: e => e.speedtest?.download_mbps || null },
-  { key: 'upload',       label: 'UL実測 (Mbps)',        color: '#bc8cff', yAxis: 'yMbps',   defaultOn: true,  dash: [4,4], pointR: 4,  src: 'speedtest', getValue: e => e.speedtest?.upload_mbps || null },
-  { key: 'ping',         label: 'Ping遅延 (ms)',         color: '#ff7b72', yAxis: 'yMs',     defaultOn: true,  dash: [3,3], pointR: 5,  src: 'speedtest', getValue: e => e.speedtest?.ping_ms || null },
-  { key: 'loss',         label: 'パケットロス (%)',      color: '#f85149', yAxis: 'yPercent', defaultOn: false, dash: [2,4], pointR: 4,  src: 'status',    getValue: e => e.packet_loss?.loss_pct ?? null },
-  { key: 'devices',      label: 'ARP機器数 (台)',         color: '#f0c060', yAxis: 'yDevices', defaultOn: true,  dash: [],    pointR: 2,  src: 'status',    getValue: e => e.active_devices || null },
-  { key: 'bss_stations', label: 'BSS接続台数 (台)',       color: '#79c0ff', yAxis: 'yDevices', defaultOn: false, dash: [2,2], pointR: 4,  src: 'bss',       getValue: e => e.bss_scan?.total_stations ?? null },
+  { key: 'signal',       label: '電波強度 (%)',        color: '#3fb950', yAxis: 'yPercent', defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseInt(e.wifi?.signal) || null,       shortLabel: '電波強度' },
+  { key: 'rx',           label: 'リンク速度Rx (Mbps)', color: '#58a6ff', yAxis: 'yMbps',   defaultOn: true,  dash: [],    pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.rx_rate) || null,    shortLabel: 'Rx速度' },
+  { key: 'tx',           label: 'リンク速度Tx (Mbps)', color: '#a5d6ff', yAxis: 'yMbps',   defaultOn: false, dash: [4,3], pointR: 0,  src: 'status',    getValue: e => parseFloat(e.wifi?.tx_rate) || null,    shortLabel: 'Tx速度' },
+  { key: 'download',     label: 'DL実測 (Mbps)',        color: '#f0a030', yAxis: 'yMbps',   defaultOn: true,  dash: [6,3], pointR: 4,  src: 'status',    getValue: e => e.speedtest?.download_mbps || null,     shortLabel: 'DL実測' },
+  { key: 'upload',       label: 'UL実測 (Mbps)',        color: '#bc8cff', yAxis: 'yMbps',   defaultOn: true,  dash: [4,4], pointR: 4,  src: 'status',    getValue: e => e.speedtest?.upload_mbps || null,       shortLabel: 'UL実測' },
+  { key: 'ping',         label: 'Ping遅延 (ms)',         color: '#ff7b72', yAxis: 'yMs',     defaultOn: true,  dash: [3,3], pointR: 5,  src: 'status',    getValue: e => e.speedtest?.ping_ms || null,           shortLabel: 'Ping' },
+  { key: 'loss',         label: 'パケットロス (%)',      color: '#f85149', yAxis: 'yPercent', defaultOn: false, dash: [2,4], pointR: 4,  src: 'status',    getValue: e => e.packet_loss?.loss_pct ?? null,        shortLabel: 'ロス率' },
+  { key: 'devices',      label: 'ARP機器数 (台)',         color: '#f0c060', yAxis: 'yDevices', defaultOn: true,  dash: [],    pointR: 2,  src: 'status',    getValue: e => e.active_devices || null,               shortLabel: 'ARP機器' },
+  { key: 'bss_stations', label: 'BSS接続台数 (台)',       color: '#79c0ff', yAxis: 'yDevices', defaultOn: false, dash: [2,2], pointR: 4,  src: 'bss',       getValue: e => e.bss_scan?.total_stations ?? null,     shortLabel: 'BSS台数' },
 ];
 
 // 各データセットの表示状態
@@ -291,6 +841,9 @@ function loadFile(file) {
       allEntries = JSON.parse(e.target.result);
       render();
       renderChart();
+      renderNetworkDiag();
+      renderMobilityAnalysis();
+      toggleDock(true);
     } catch { alert('JSONの読み込みに失敗しました。'); }
   };
   r.readAsText(file, 'utf-8');
@@ -311,6 +864,9 @@ function renderChart() {
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 
   if (statusEntries.length === 0) return;
+
+  // Store for chart↔log cross-linking
+  _chartStatusEntries = statusEntries;
 
   document.getElementById('chartCard').style.display = 'block';
 
@@ -369,6 +925,7 @@ function renderChart() {
       responsive: true,
       maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
+      onClick: (evt, elements) => onChartClick(evt, elements),
       plugins: {
         legend: { display: false },
         tooltip: {
@@ -378,6 +935,27 @@ function renderChart() {
           titleColor: '#c9d1d9',
           bodyColor: '#8b949e',
           filter: item => !item.dataset.hidden,
+        },
+        zoom: {
+          pan: {
+            enabled: true,
+            mode: 'x',
+            modifierKey: 'ctrl',
+          },
+          zoom: {
+            wheel: { enabled: true, modifierKey: null },
+            pinch: { enabled: true },
+            drag: {
+              enabled: true,
+              backgroundColor: 'rgba(88,166,255,0.15)',
+              borderColor: 'rgba(88,166,255,0.6)',
+              borderWidth: 1,
+            },
+            mode: 'x',
+          },
+          limits: {
+            x: { minRange: 3 },
+          },
         },
       },
       scales: {
@@ -422,7 +1000,7 @@ function renderChart() {
   togglesEl.innerHTML = DS_CONFIG.map((cfg, idx) => `
     <button class="ds-btn ${dsVisible[cfg.key] ? 'active' : ''}" data-key="${cfg.key}" data-idx="${idx}">
       <span class="dot" style="background:${cfg.color}"></span>
-      ${cfg.label}
+      ${cfg.shortLabel || cfg.label} ${hint(cfg.key)}
     </button>
   `).join('');
 
@@ -444,6 +1022,689 @@ function renderChart() {
       mainChart.update();
     });
   });
+}
+
+// ---- Network Path Diagnosis Visualization ----
+function renderNetworkDiag() {
+  const card = document.getElementById('netDiagCard');
+  const qEntries = allEntries.filter(e => e.type === 'STATUS' && e.quality?.layers);
+  if (!qEntries.length) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+
+  const LAYERS = ['wifi', 'router', 'dns', 'internet', 'speed'];
+  const ICONS  = { wifi: '📶', router: '🔀', dns: '🔍', internet: '🌐', speed: '⚡' };
+  const NAMES  = { wifi: 'Wi-Fi電波', router: 'ルーター', dns: 'DNS解決', internet: 'ネット回線', speed: '実効速度' };
+
+  // Compute averages & bottleneck counts
+  const layerScores = {}; const bnCounts = {};
+  LAYERS.forEach(l => { layerScores[l] = []; bnCounts[l] = 0; });
+  qEntries.forEach(e => {
+    LAYERS.forEach(l => {
+      const layer = e.quality.layers[l];
+      if (layer?.score != null) layerScores[l].push(layer.score);
+    });
+    if (e.quality.bottleneck && bnCounts.hasOwnProperty(e.quality.bottleneck))
+      bnCounts[e.quality.bottleneck]++;
+  });
+
+  const avgs = {};
+  LAYERS.forEach(l => {
+    avgs[l] = layerScores[l].length
+      ? Math.round(layerScores[l].reduce((a,b)=>a+b,0) / layerScores[l].length)
+      : null;
+  });
+  const totalBn = Object.values(bnCounts).reduce((a,b)=>a+b, 0);
+  const topBn = totalBn > 0
+    ? LAYERS.reduce((a,b) => (bnCounts[a]||0) >= (bnCounts[b]||0) ? a : b)
+    : null;
+
+  const nodeColor = s =>
+    s == null ? 'var(--muted)' : s >= 70 ? 'var(--green)' : s >= 40 ? 'var(--yellow)' : 'var(--red)';
+
+  // Detect mostly-skipped layers
+  const skipLayers = {};
+  LAYERS.forEach(l => {
+    const skipN = qEntries.filter(e => e.quality.layers[l]?.status === 'skip').length;
+    skipLayers[l] = skipN > qEntries.length * 0.7;
+  });
+
+  // ── Network Path Map (SVG) ──
+  const LCOLORS_PATH = { wifi:'#3fb950', router:'#f0c060', internet:'#58a6ff', dns:'#bc8cff', speed:'#f0a030' };
+  const nodeColorHex = s =>
+    s == null ? '#6e7681' : s >= 70 ? '#3fb950' : s >= 40 ? '#d29922' : '#f85149';
+
+  // Node definitions: x positions spread across 900-width SVG
+  const allNodes = [
+    { id: 'pc',       x: 60,  icon: '💻', name: 'このPC',      color: '#58a6ff', score: null, skip: false, bn: false, bnN: 0 },
+    { id: 'wifi',     x: 210, icon: '📶', name: 'Wi-Fi電波',   color: '', score: 0, skip: false, bn: false, bnN: 0 },
+    { id: 'router',   x: 370, icon: '🔀', name: 'ルーター',    color: '', score: 0, skip: false, bn: false, bnN: 0 },
+    { id: 'dns',      x: 540, icon: '🔍', name: 'DNS解決',     color: '', score: 0, skip: false, bn: false, bnN: 0 },
+    { id: 'internet', x: 700, icon: '🌐', name: 'ネット回線',  color: '', score: 0, skip: false, bn: false, bnN: 0 },
+    { id: 'speed',    x: 850, icon: '⚡', name: '実効速度',     color: '', score: 0, skip: false, bn: false, bnN: 0 },
+  ];
+  allNodes.forEach(n => {
+    if (n.id === 'pc') return;
+    const s = avgs[n.id];
+    n.score = s;
+    n.skip  = skipLayers[n.id];
+    n.color = nodeColorHex(s);  // always use real color, even for skip
+    n.bn    = n.id === topBn;
+    n.bnN   = bnCounts[n.id] || 0;
+  });
+
+  const NY = 76; // node center Y
+  const R  = 28; // node circle radius
+
+  // Build SVG
+  let svg = `<div class="net-map"><svg viewBox="0 0 910 190" xmlns="http://www.w3.org/2000/svg">`;
+
+  // ── Defs: filters, patterns, gradients ──
+  svg += '<defs>';
+  svg += '<filter id="glow"><feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>';
+  svg += '<filter id="glow-lg"><feGaussianBlur stdDeviation="6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>';
+  svg += '<filter id="glow-wide"><feGaussianBlur stdDeviation="10"/></filter>';
+  // Hex grid pattern (visible against dark bg)
+  svg += '<pattern id="hexGrid" width="28" height="32" patternUnits="userSpaceOnUse">';
+  svg += '<path d="M14,0 L28,8 28,24 14,32 0,24 0,8Z" fill="none" stroke="#2a2f3a" stroke-width=".4"/>';
+  svg += '</pattern>';
+  // Per-edge connection gradients
+  for (let i = 0; i < allNodes.length - 1; i++) {
+    const b = allNodes[i + 1];
+    const ec = b.color || '#58a6ff';
+    svg += `<linearGradient id="cg${i}" x1="${allNodes[i].x}" y1="0" x2="${b.x}" y2="0" gradientUnits="userSpaceOnUse">`;
+    svg += `<stop offset="0" stop-color="${ec}" stop-opacity=".15"/><stop offset=".5" stop-color="${ec}" stop-opacity=".8"/><stop offset="1" stop-color="${ec}" stop-opacity=".15"/>`;
+    svg += '</linearGradient>';
+  }
+  svg += '</defs>';
+
+  // ── Background ──
+  svg += '<rect width="910" height="190" fill="url(#hexGrid)" opacity=".75"/>';
+  // Title
+  svg += '<text x="455" y="14" text-anchor="middle" fill="#30363d" font-size="7.5" letter-spacing=".18em" class="nm-mono">NETWORK TOPOLOGY ― REAL-TIME DIAGNOSTIC</text>';
+  // Central data-bus line
+  svg += `<line x1="${allNodes[0].x}" y1="${NY}" x2="${allNodes[allNodes.length-1].x}" y2="${NY}" stroke="#21262d" stroke-width=".5" stroke-dasharray="1 8" opacity=".25"/>`;
+  // Tick marks at top
+  for (let tx = 60; tx <= 860; tx += 80) {
+    svg += `<line x1="${tx}" y1="20" x2="${tx}" y2="26" stroke="#21262d" stroke-width=".5" opacity=".25"/>`;
+  }
+
+  // Connection lines between nodes (S-curve data highway)
+  for (let i = 0; i < allNodes.length - 1; i++) {
+    const a = allNodes[i], b = allNodes[i + 1];
+    const c = b.color || '#58a6ff';
+    const x1 = a.x + R + 2, x2 = b.x - R - 2;
+    const seg = (x2 - x1) / 3;
+    const amp = 14;
+    // S-curve (wave): up then down
+    const pathD = `M${x1},${NY} C${x1 + seg},${NY - amp} ${x1 + seg * 2},${NY + amp} ${x2},${NY}`;
+    // Wide glow underlay
+    svg += `<path d="${pathD}" fill="none" stroke="${c}" stroke-width="10" opacity=".04" filter="url(#glow-wide)"/>`;
+    // Main path (gradient stroke)
+    svg += `<path d="${pathD}" fill="none" stroke="url(#cg${i})" stroke-width="1.5" opacity=".5"/>`;
+    // Animated flow particles (multi-layer, smooth)
+    svg += `<path d="${pathD}" fill="none" stroke="${c}" stroke-width="2.5" stroke-dasharray="2 22" class="nm-flow" opacity=".65"/>`;
+    svg += `<path d="${pathD}" fill="none" stroke="${c}" stroke-width="1.5" stroke-dasharray="1 30" class="nm-flow2" opacity=".35"/>`;
+    svg += `<path d="${pathD}" fill="none" stroke="${c}" stroke-width="1"   stroke-dasharray="1 40" class="nm-flow3" opacity=".2"/>`;
+  }
+
+  // ── Draw Nodes ──
+  allNodes.forEach(n => {
+    const c = n.id === 'pc' ? '#58a6ff' : n.color;
+    const isInternet = n.id === 'internet';
+    const bnClass = n.bn ? ' nm-bn-node' : '';
+
+    svg += `<g class="${bnClass}">`;
+
+    // Layer 1: Pulse ring (expanding + fading, SMIL animated)
+    if (n.id !== 'pc') {
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${R}" fill="none" stroke="${c}" stroke-width=".6" opacity="0">`;
+      svg += `<animate attributeName="r" from="${R}" to="${R + 18}" dur="2.5s" repeatCount="indefinite"/>`;
+      svg += `<animate attributeName="opacity" from=".35" to="0" dur="2.5s" repeatCount="indefinite"/>`;
+      svg += '</circle>';
+    }
+
+    // Layer 2: Rotating orbit ring
+    if (n.id !== 'pc') {
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${R + 9}" fill="none" stroke="${c}" stroke-width=".35" stroke-dasharray="4 6" opacity=".3">`;
+      svg += `<animateTransform attributeName="transform" type="rotate" from="0 ${n.x} ${NY}" to="360 ${n.x} ${NY}" dur="25s" repeatCount="indefinite"/>`;
+      svg += '</circle>';
+      // Counter-rotating inner orbit
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${R + 5}" fill="none" stroke="${c}" stroke-width=".25" stroke-dasharray="2 8" opacity=".2">`;
+      svg += `<animateTransform attributeName="transform" type="rotate" from="360 ${n.x} ${NY}" to="0 ${n.x} ${NY}" dur="18s" repeatCount="indefinite"/>`;
+      svg += '</circle>';
+    }
+
+    // Layer 3: Outer glow ring
+    if (n.id !== 'pc') {
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${R + 3}" fill="none" stroke="${c}" stroke-width=".5" opacity=".2" filter="url(#glow)"/>`;
+    }
+
+    // Layer 4: Main circle
+    if (isInternet) {
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${R}" fill="#0d1117" stroke="${c}" stroke-width="2"/>`;
+      // Globe meridians
+      svg += `<ellipse cx="${n.x}" cy="${NY}" rx="${R * .55}" ry="${R - 2}" fill="none" stroke="${c}" stroke-width=".6" opacity=".25"/>`;
+      svg += `<ellipse cx="${n.x}" cy="${NY}" rx="${R - 2}" ry="${R * .45}" fill="none" stroke="${c}" stroke-width=".4" opacity=".12"/>`;
+      svg += `<line x1="${n.x - R + 4}" y1="${NY}" x2="${n.x + R - 4}" y2="${NY}" stroke="${c}" stroke-width=".6" opacity=".2"/>`;
+      svg += `<line x1="${n.x}" y1="${NY - R + 4}" x2="${n.x}" y2="${NY + R - 4}" stroke="${c}" stroke-width=".4" opacity=".12"/>`;
+    } else {
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${R}" fill="#0d1117" stroke="${c}" stroke-width="2"/>`;
+    }
+
+    // Layer 5: Inner hexagonal frame overlay
+    {
+      const hr = R - 4;
+      const hex = Array.from({length: 6}, (_, k) => {
+        const a = Math.PI / 6 + k * Math.PI / 3;
+        return `${(n.x + hr * Math.cos(a)).toFixed(1)},${(NY + hr * Math.sin(a)).toFixed(1)}`;
+      }).join(' ');
+      svg += `<polygon points="${hex}" fill="none" stroke="${c}" stroke-width=".35" opacity=".12"/>`;
+    }
+
+    // Layer 6: Score gauge arc (inside node)
+    if (n.score != null && n.id !== 'pc') {
+      const pct = n.score / 100;
+      const arcR = R - 5;
+      const circ = 2 * Math.PI * arcR;
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${arcR}" fill="none" stroke="#21262d" stroke-width="2.5"/>`;
+      svg += `<circle cx="${n.x}" cy="${NY}" r="${arcR}" fill="none" stroke="${c}" stroke-width="2.5" stroke-dasharray="${(circ * pct).toFixed(1)} ${(circ * (1 - pct)).toFixed(1)}" stroke-dashoffset="${(circ * 0.25).toFixed(1)}" stroke-linecap="round" opacity=".55"/>`;
+    }
+
+    // Icon
+    svg += `<text x="${n.x}" y="${NY + 1}" text-anchor="middle" dominant-baseline="central" font-size="18">${n.icon}</text>`;
+
+    // Name label
+    svg += `<text x="${n.x}" y="${NY + R + 16}" text-anchor="middle" fill="#8b949e" font-size="10">${n.name}</text>`;
+
+    // Score in HUD-style readout box
+    if (n.id !== 'pc') {
+      const sStr = n.skip ? 'SKIP' : n.score != null ? n.score + '%' : '---';
+      const sY = NY + R + 31;
+      const bw = 46, bh = 17;
+      svg += `<rect x="${n.x - bw/2}" y="${sY - bh/2}" width="${bw}" height="${bh}" rx="3" fill="${c}" fill-opacity=".07" stroke="${c}" stroke-width=".5" opacity=".55"/>`;
+      svg += `<text x="${n.x}" y="${sY + 1}" text-anchor="middle" dominant-baseline="central" fill="${c}" font-size="12" font-weight="700" class="nm-mono">${sStr}</text>`;
+    }
+
+    // Hint icon (? circle) — below score box
+    if (n.id !== 'pc' && GLOSSARY[n.id]) {
+      const hy = NY + R + 49;
+      svg += `<g class="nm-hint" style="cursor:help"><circle cx="${n.x}" cy="${hy}" r="6.5" fill="rgba(88,166,255,.1)" stroke="#58a6ff" stroke-width=".6"/><text x="${n.x}" y="${hy}" text-anchor="middle" dominant-baseline="central" fill="#58a6ff" font-size="8" font-weight="700">?</text></g>`;
+      const tipW = 190, tipH = 40;
+      // 端ノードはヒントボックスを枠内に収める
+      let tipX, tipAnchor;
+      if (n.x < 120) { // 左端
+        tipX = 8;
+        tipAnchor = 'start';
+      } else if (n.x > 910 - 120) { // 右端
+        tipX = 910 - tipW - 8;
+        tipAnchor = 'start'; // 右端も左寄せ
+      } else {
+        tipX = n.x - tipW / 2;
+        tipAnchor = 'middle';
+      }
+      const tipY = NY - R - tipH - 18;
+      const lines = GLOSSARY[n.id].match(/.{1,28}/g) || [GLOSSARY[n.id]];
+      svg += `<g class="nm-hint-tip"><rect x="${tipX}" y="${tipY}" width="${tipW}" height="${Math.max(tipH, lines.length * 14 + 12)}" rx="6" fill="#1c2128" stroke="#30363d" stroke-width=".8"/>`;
+      lines.forEach((line, li) => {
+        let tx = tipX + 8;
+        svg += `<text x="${tx}" y="${tipY + 14 + li * 14}" fill="#c9d1d9" font-size="10" text-anchor="start">${line}</text>`;
+      });
+      svg += '</g>';
+    }
+
+    // BN badge (with glow)
+    if (n.bnN > 0) {
+      svg += `<circle cx="${n.x + R - 2}" cy="${NY - R + 2}" r="9" fill="#f85149" filter="url(#glow)"/>`;
+      svg += `<text x="${n.x + R - 2}" y="${NY - R + 2}" text-anchor="middle" dominant-baseline="central" fill="#fff" font-size="8" font-weight="700" class="nm-mono">${n.bnN}</text>`;
+    }
+
+    // Status LED (small dot below node)
+    if (n.id !== 'pc') {
+      const ledY = NY - R - 6;
+      const ledC = n.score >= 70 ? '#3fb950' : n.score >= 40 ? '#d29922' : n.score != null ? '#f85149' : '#6e7681';
+      svg += `<circle cx="${n.x}" cy="${ledY}" r="2" fill="${ledC}" opacity=".7"/>`;
+      svg += `<circle cx="${n.x}" cy="${ledY}" r="2" fill="${ledC}" opacity=".3" filter="url(#glow)"/>`;
+    }
+
+    svg += '</g>';
+  });
+
+  // Skip note
+  const skippedNames = LAYERS.filter(l => skipLayers[l]).map(l => NAMES[l]);
+  if (skippedNames.length) {
+    // 端ノードで警告がはみ出さないよう調整
+    let skipX, skipAnchor;
+    if (skippedNames.length === 1 && allNodes.find(n => n.name === skippedNames[0])?.x < 120) {
+      skipX = 8;
+      skipAnchor = 'start';
+    } else if (skippedNames.length === 1 && allNodes.find(n => n.name === skippedNames[0])?.x > 910 - 120) {
+      skipX = 910 - 8;
+      skipAnchor = 'end';
+    } else {
+      skipX = 455;
+      skipAnchor = 'middle';
+    }
+    svg += `<text x="${skipX}" y="183" text-anchor="${skipAnchor}" fill="#6e7681" font-size="9" opacity=".7">⚠ ${skippedNames.join('・')}: ICMP無応答のためスキップ（通信自体は経由中）</text>`;
+  }
+
+  svg += '</svg></div>';
+  document.getElementById('pathDiagram').innerHTML = svg;
+
+  // ── Health Timeline (Layer Score Over Time) ──
+  const sorted = [...qEntries].sort((a,b) => a.timestamp.localeCompare(b.timestamp));
+  const LCOLORS = { wifi: '#3fb950', router: '#f0c060', internet: '#58a6ff', dns: '#bc8cff', speed: '#f0a030' };
+  const activeLayers = LAYERS.filter(l => !skipLayers[l]);
+
+  let htH = '<div class="ht-wrap"><canvas id="healthChart"></canvas></div>';
+  // Toggle buttons for each layer
+  htH += '<div class="ht-toggles" id="htToggles">';
+  activeLayers.forEach(l => {
+    htH += `<button class="ds-btn active" data-htlayer="${l}"><span class="dot" style="background:${LCOLORS[l]}"></span>${ICONS[l]} ${NAMES[l]}</button>`;
+  });
+  htH += '</div>';
+  // Zoom controls
+  htH += '<div class="ht-controls">';
+  htH += '<span class="zoom-hint">🔍 ドラッグで範囲ズーム · ホイールでズーム · Ctrl+ドラッグでスクロール</span>';
+  htH += '<button class="zoom-btn" id="htZoomResetBtn">&#x21ba; リセット</button>';
+  htH += '</div>';
+  // Zone legend
+  htH += '<div class="ht-legend ht-legend-zones">';
+  htH += '<div class="ht-legend-item"><span class="ht-swatch" style="background:rgba(35,134,54,.3)"></span>良好(70+)</div>';
+  htH += '<div class="ht-legend-item"><span class="ht-swatch" style="background:rgba(158,106,3,.3)"></span>注意(40–69)</div>';
+  htH += '<div class="ht-legend-item"><span class="ht-swatch" style="background:rgba(218,54,51,.3)"></span>問題(&lt;40)</div>';
+  htH += '<div class="ht-legend-item"><span class="ht-bn-dot"></span>ボトルネック</div>';
+  htH += '</div>';
+  document.getElementById('healthHeatmap').innerHTML = htH;
+
+  if (healthTLChart) healthTLChart.destroy();
+  const htCtx = document.getElementById('healthChart').getContext('2d');
+  healthTLChart = new Chart(htCtx, {
+    type: 'line',
+    data: {
+      labels: sorted.map(e => e.timestamp.slice(11, 16)),
+      datasets: activeLayers.map(l => ({
+        label: NAMES[l],
+        data: sorted.map(e => {
+          const layer = e.quality.layers[l];
+          return (layer?.status === 'skip' || layer?.score == null) ? null : layer.score;
+        }),
+        borderColor: LCOLORS[l],
+        backgroundColor: LCOLORS[l] + '18',
+        borderWidth: 2,
+        pointRadius: sorted.map(e => e.quality.bottleneck === l ? 5 : 0),
+        pointBackgroundColor: sorted.map(e => e.quality.bottleneck === l ? '#f85149' : LCOLORS[l]),
+        pointBorderColor: sorted.map(e => e.quality.bottleneck === l ? '#f85149' : LCOLORS[l]),
+        pointHoverRadius: 4,
+        tension: 0.3,
+        fill: false,
+        spanGaps: true,
+      })),
+    },
+    plugins: [{
+      id: 'zoneShading',
+      beforeDraw(chart) {
+        const { ctx, chartArea } = chart;
+        if (!chartArea) return;
+        const { left, right, top, bottom } = chartArea;
+        const h = bottom - top;
+        ctx.save();
+        // Green zone (70-100)
+        ctx.fillStyle = 'rgba(35, 134, 54, 0.06)';
+        ctx.fillRect(left, top, right - left, h * 0.3);
+        // Yellow zone (40-70)
+        ctx.fillStyle = 'rgba(158, 106, 3, 0.06)';
+        ctx.fillRect(left, top + h * 0.3, right - left, h * 0.3);
+        // Red zone (0-40)
+        ctx.fillStyle = 'rgba(218, 54, 51, 0.06)';
+        ctx.fillRect(left, top + h * 0.6, right - left, h * 0.4);
+        // Reference lines at 70% and 40%
+        ctx.setLineDash([4, 4]);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(110, 118, 129, 0.25)';
+        [0.3, 0.6].forEach(pct => {
+          ctx.beginPath();
+          ctx.moveTo(left, top + h * pct);
+          ctx.lineTo(right, top + h * pct);
+          ctx.stroke();
+        });
+        ctx.restore();
+      }
+    }],
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#161b22',
+          borderColor: '#21262d',
+          borderWidth: 1,
+          titleColor: '#c9d1d9',
+          bodyColor: '#8b949e',
+          callbacks: {
+            label: ctx => {
+              const v = ctx.parsed.y;
+              const bn = sorted[ctx.dataIndex]?.quality?.bottleneck;
+              const layerKey = activeLayers[ctx.datasetIndex];
+              const isBn = bn === layerKey;
+              return ` ${ctx.dataset.label}: ${v != null ? v + '%' : '---'}${isBn ? ' 🔥BN' : ''}`;
+            }
+          }
+        },
+        zoom: {
+          pan: { enabled: true, mode: 'x', modifierKey: 'ctrl' },
+          zoom: {
+            wheel: { enabled: true },
+            pinch: { enabled: true },
+            drag: {
+              enabled: true,
+              backgroundColor: 'rgba(88,166,255,0.15)',
+              borderColor: 'rgba(88,166,255,0.6)',
+              borderWidth: 1,
+            },
+            mode: 'x',
+          },
+          limits: { x: { minRange: 3 } },
+        },
+      },
+      scales: {
+        x: {
+          ticks: { color: '#6e7681', maxTicksLimit: 10, font: { family: 'IBM Plex Mono', size: 10 } },
+          grid: { color: '#21262d' },
+        },
+        y: {
+          min: 0, max: 100,
+          ticks: {
+            color: '#6e7681',
+            font: { family: 'IBM Plex Mono', size: 10 },
+            stepSize: 20,
+            callback: v => v + '%',
+          },
+          grid: { color: '#21262d' },
+        },
+      },
+    },
+  });
+
+  // Zoom reset button
+  document.getElementById('htZoomResetBtn').addEventListener('click', () => {
+    if (healthTLChart) healthTLChart.resetZoom();
+  });
+
+  // Layer toggle buttons
+  document.getElementById('htToggles').querySelectorAll('.ds-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const layer = btn.dataset.htlayer;
+      const idx = activeLayers.indexOf(layer);
+      if (idx < 0) return;
+      const ds = healthTLChart.data.datasets[idx];
+      ds.hidden = !ds.hidden;
+      btn.classList.toggle('active', !ds.hidden);
+      healthTLChart.update();
+    });
+  });
+
+  // ── Bottleneck Frequency ──
+  let bnH = '<div class="bn-chart">';
+  if (totalBn > 0) {
+    const bnSorted = LAYERS.filter(l => bnCounts[l] > 0).sort((a,b) => bnCounts[b] - bnCounts[a]);
+    bnSorted.forEach(l => {
+      const count = bnCounts[l];
+      const pct = Math.round(count / totalBn * 100);
+      const width = Math.max(count / totalBn * 100, 4);
+      const color = nodeColor(avgs[l]);
+      bnH += `<div class="bn-row"><span class="bn-name">${ICONS[l]} ${NAMES[l]}</span><div class="bn-bar-wrap"><div class="bn-bar-fill" style="width:${width}%;background:${color}"></div></div><span class="bn-count">${count}回 (${pct}%)</span></div>`;
+    });
+  } else {
+    bnH += '<div style="text-align:center;color:var(--muted);padding:12px;font-size:13px">ボトルネックは検出されていません ✅</div>';
+  }
+  bnH += '</div>';
+  document.getElementById('bnFrequency').innerHTML = bnH;
+}
+
+// ---- AP Mobility / Tethering Analysis ----
+function renderMobilityAnalysis() {
+  const card = document.getElementById('mobCard');
+  const statusEntries = allEntries
+    .filter(e => e.type === 'STATUS' && e.wifi?.signal != null)
+    .sort((a,b) => a.timestamp.localeCompare(b.timestamp));
+
+  if (statusEntries.length < 3) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+
+  // ── Tethering detection ──
+  const ssids = new Set(allEntries.filter(e => e.wifi?.ssid).map(e => e.wifi.ssid));
+  const TETHER_PATTERNS = /^(iphone|ipad|android|galaxy|pixel|huawei|xperia|aquos|redmi|oppo|oneplus|xiaomi|realme|poc[co]|motorola|sharp|arrows|basio)/i;
+  const TETHER_KEYWORDS = /(hotspot|tethering|的iphone|のiphone|のandroid|テザリング)/i;
+  let isTethering = false;
+  let tetherSSID = '';
+  for (const ssid of ssids) {
+    if (TETHER_PATTERNS.test(ssid) || TETHER_KEYWORDS.test(ssid)) {
+      isTethering = true;
+      tetherSSID = ssid;
+      break;
+    }
+  }
+
+  // Badge
+  const badge = document.getElementById('mobTypeBadge');
+  if (isTethering) {
+    badge.className = 'mob-type-badge mob-type-tether';
+    badge.textContent = `📱 テザリング (${tetherSSID})`;
+  } else {
+    badge.className = 'mob-type-badge mob-type-fixed';
+    badge.textContent = `🏠 固定Wi-Fi (${[...ssids][0] || '---'})`;
+  }
+
+  // ── Signal data extraction ──
+  const signals = statusEntries.map(e => parseInt(e.wifi.signal));
+  const rssis = statusEntries.map(e => e.wifi.rssi_dbm ?? (-(100 - parseInt(e.wifi.signal))));
+  const channels = statusEntries.map(e => parseInt(e.wifi.channel) || 0);
+  const timestamps = statusEntries.map(e => e.timestamp);
+
+  // ── Statistics ──
+  const avgSig = Math.round(signals.reduce((a,b)=>a+b,0) / signals.length);
+  const minSig = Math.min(...signals);
+  const maxSig = Math.max(...signals);
+  const stdDev = Math.round(Math.sqrt(signals.reduce((sum, v) => sum + (v - avgSig) ** 2, 0) / signals.length));
+
+  // Stability score: 0-100 (100 = perfectly stable)
+  const stabilityScore = Math.max(0, Math.min(100, Math.round(100 - stdDev * 4)));
+  const stabColor = stabilityScore >= 70 ? 'var(--green)' : stabilityScore >= 40 ? 'var(--yellow)' : 'var(--red)';
+  const stabLabel = stabilityScore >= 70 ? '安定' : stabilityScore >= 40 ? 'やや不安定' : '不安定';
+
+  // ── Distance estimation (log-distance path loss model) ──
+  // For 2.4GHz tethering: reference power at 1m ≈ -40dBm, path loss exponent n ≈ 2.5
+  // For 5GHz: reference power at 1m ≈ -44dBm, n ≈ 2.7
+  const is5GHz = channels.some(ch => ch >= 36);
+  const txPower1m = is5GHz ? -44 : -40;
+  const pathN = is5GHz ? 2.7 : 2.5;
+  function rssiToDistance(rssi) {
+    if (rssi >= txPower1m) return 0.3; // very close
+    const d = Math.pow(10, (txPower1m - rssi) / (10 * pathN));
+    return Math.round(d * 10) / 10;
+  }
+
+  const distances = rssis.map(rssiToDistance);
+  const avgDist = Math.round(distances.reduce((a,b)=>a+b,0) / distances.length * 10) / 10;
+  const minDist = Math.round(Math.min(...distances) * 10) / 10;
+  const maxDist = Math.round(Math.max(...distances) * 10) / 10;
+  const latestDist = distances[distances.length - 1];
+
+  // ── Rapid signal drop events ──
+  // Drop: signal decreases by >= 15% within consecutive readings
+  const drops = [];
+  for (let i = 1; i < signals.length; i++) {
+    const delta = signals[i - 1] - signals[i];
+    if (delta >= 15) {
+      drops.push({
+        time: timestamps[i].slice(11, 16),
+        from: signals[i - 1],
+        to: signals[i],
+        delta,
+        distBefore: distances[i - 1],
+        distAfter: distances[i],
+      });
+    }
+  }
+
+  // Disconnection count
+  const discCount = allEntries.filter(e => e.type === 'DISCONNECTION').length;
+
+  // ── Summary metrics ──
+  let summaryH = '';
+  summaryH += `<div class="mob-metric">
+    <div class="mm-label">電波安定度 ${hint('stability')}</div>
+    <div class="mm-val" style="color:${stabColor}">${stabilityScore}%</div>
+    <div class="mm-sub">${stabLabel} (σ=${stdDev}%)</div>
+  </div>`;
+  summaryH += `<div class="mob-metric">
+    <div class="mm-label">電波範囲 ${hint('signal_range')}</div>
+    <div class="mm-val">${minSig}% → ${maxSig}%</div>
+    <div class="mm-sub">平均 ${avgSig}% / 振幅 ${maxSig - minSig}%</div>
+  </div>`;
+  summaryH += `<div class="mob-metric">
+    <div class="mm-label">推定距離（平均） ${hint('est_distance')}</div>
+    <div class="mm-val" style="color:${avgDist <= 3 ? 'var(--green)' : avgDist <= 8 ? 'var(--yellow)' : 'var(--red)'}">${avgDist} m</div>
+    <div class="mm-sub">${minDist}m 〜 ${maxDist}m</div>
+  </div>`;
+  summaryH += `<div class="mob-metric">
+    <div class="mm-label">急変動イベント ${hint('rapid_drop')}</div>
+    <div class="mm-val" style="color:${drops.length === 0 ? 'var(--green)' : drops.length <= 3 ? 'var(--yellow)' : 'var(--red)'}">${drops.length} 回</div>
+    <div class="mm-sub">${isTethering ? 'AP移動の可能性' : '干渉の可能性'}</div>
+  </div>`;
+  summaryH += `<div class="mob-metric">
+    <div class="mm-label">切断回数 ${hint('disconnection')}</div>
+    <div class="mm-val" style="color:${discCount === 0 ? 'var(--green)' : 'var(--red)'}">${discCount} 回</div>
+    <div class="mm-sub">${discCount > 0 && isTethering ? 'AP圏外離脱の疑い' : discCount > 0 ? '接続不安定' : '切断なし'}</div>
+  </div>`;
+  document.getElementById('mobSummary').innerHTML = summaryH;
+
+  // ── Distance gauge ──
+  const gaugeMax = Math.max(15, Math.ceil(maxDist / 5) * 5);
+  const markerPct = Math.min(100, (latestDist / gaugeMax) * 100);
+  let gaugeH = `<div style="font-size:11px;color:var(--muted);margin-bottom:4px">推定距離ゲージ（最新: <strong style="color:var(--text)">${latestDist}m</strong>）</div>`;
+  gaugeH += '<div class="dist-gauge">';
+  gaugeH += '<span style="font-size:18px">📱</span>';
+  gaugeH += '<div class="dist-gauge-track">';
+  gaugeH += '<div class="dist-gauge-zones">';
+  gaugeH += `<div class="dist-zone" style="width:${(3/gaugeMax)*100}%;background:#238636"></div>`;
+  gaugeH += `<div class="dist-zone" style="width:${(5/gaugeMax)*100}%;background:#9e6a03"></div>`;
+  gaugeH += `<div class="dist-zone" style="flex:1;background:#da3633"></div>`;
+  gaugeH += '</div>';
+  gaugeH += `<div class="dist-gauge-marker" style="left:${markerPct}%"></div>`;
+  gaugeH += '</div>';
+  gaugeH += '<span style="font-size:18px">💻</span>';
+  gaugeH += '</div>';
+  gaugeH += '<div class="dist-gauge-labels" style="margin:0 34px">';
+  gaugeH += '<span>0m</span>';
+  gaugeH += `<span style="position:relative;left:${(3/gaugeMax)*50}%">3m</span>`;
+  gaugeH += `<span style="position:relative">8m</span>`;
+  gaugeH += `<span>${gaugeMax}m</span>`;
+  gaugeH += '</div>';
+  document.getElementById('mobDistGauge').innerHTML = gaugeH;
+
+  // ── Signal + Distance sparkline (canvas) ──
+  let sparkH = '<div style="font-size:11px;color:var(--muted);margin: 14px 0 4px">電波強度 × 推定距離 タイムライン</div>';
+  sparkH += '<div class="mob-spark-wrap"><canvas id="mobSparkCanvas"></canvas>';
+  sparkH += '<div class="mob-spark-overlay">📶% / 📏m</div></div>';
+  document.getElementById('mobSparkline').innerHTML = sparkH;
+
+  // Draw sparkline on canvas
+  requestAnimationFrame(() => {
+    const canvas = document.getElementById('mobSparkCanvas');
+    if (!canvas) return;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * 2;
+    canvas.height = rect.height * 2;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(2, 2);
+    const W = rect.width, H = rect.height;
+    const pad = { l: 4, r: 4, t: 4, b: 4 };
+    const plotW = W - pad.l - pad.r;
+    const plotH = H - pad.t - pad.b;
+
+    // Danger zone background (distance > 8m ≈ signal < ~35%)
+    const dangerThreshold = 35;
+    ctx.fillStyle = 'rgba(218,54,51,.08)';
+    const dangerY = pad.t + plotH * (1 - dangerThreshold / 100);
+    ctx.fillRect(pad.l, pad.t, plotW, dangerY - pad.t);
+
+    // Draw signal line
+    ctx.beginPath();
+    ctx.strokeStyle = '#3fb950';
+    ctx.lineWidth = 1.5;
+    signals.forEach((s, i) => {
+      const x = pad.l + (i / (signals.length - 1)) * plotW;
+      const y = pad.t + plotH * (1 - s / 100);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Draw distance line (secondary, scaled to gaugeMax)
+    ctx.beginPath();
+    ctx.strokeStyle = '#bc8cff';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    distances.forEach((d, i) => {
+      const x = pad.l + (i / (distances.length - 1)) * plotW;
+      const y = pad.t + plotH * (1 - Math.min(d, gaugeMax) / gaugeMax);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Mark rapid drop events
+    drops.forEach(drop => {
+      const idx = timestamps.findIndex(t => t.slice(11, 16) === drop.time);
+      if (idx < 0) return;
+      const x = pad.l + (idx / (signals.length - 1)) * plotW;
+      ctx.beginPath();
+      ctx.arc(x, pad.t + plotH * (1 - drop.to / 100), 3, 0, Math.PI * 2);
+      ctx.fillStyle = '#f85149';
+      ctx.fill();
+    });
+  });
+
+  // ── Rapid drop events list ──
+  let dropsH = '';
+  if (drops.length > 0) {
+    dropsH = `<div style="font-size:11px;color:var(--muted);margin: 14px 0 6px">急変動イベント（${isTethering ? 'AP離脱の可能性' : '干渉・遮蔽の可能性'}）</div><div class="mob-drops">`;
+    drops.slice(0, 10).forEach(d => {
+      dropsH += `<div class="mob-drop-item">`;
+      dropsH += `<span class="drop-time">${d.time}</span>`;
+      dropsH += `<span class="drop-arrow">📶</span>`;
+      dropsH += `<span>${d.from}% → ${d.to}%</span>`;
+      dropsH += `<span style="color:var(--muted);margin-left:auto;font-size:11px">≈ ${d.distBefore}m → ${d.distAfter}m</span>`;
+      dropsH += `</div>`;
+    });
+    if (drops.length > 10) dropsH += `<div style="text-align:center;color:var(--muted);font-size:11px;padding:4px">… 他 ${drops.length - 10} 件</div>`;
+    dropsH += '</div>';
+  }
+  document.getElementById('mobDrops').innerHTML = dropsH;
+
+  // ── Context note ──
+  let noteH = '<div class="mob-note">';
+  if (isTethering) {
+    noteH += '<strong>📱 テザリング接続が検出されました。</strong><br>';
+    noteH += 'テザリングでは AP（スマートフォン）が移動するため、電波強度の急変動や切断が発生しやすくなります。<br>';
+    if (drops.length > 0)
+      noteH += `⚠️ <strong>${drops.length}回</strong>の急変動が記録されています。AP端末がPCから離れた可能性があります。<br>`;
+    if (discCount > 0)
+      noteH += `🔴 <strong>${discCount}回</strong>の切断が発生。AP端末が通信圏外に移動した可能性が高いです。<br>`;
+    noteH += '💡 AP端末はPCから <strong>3m以内</strong> に置くことを推奨します。';
+  } else {
+    noteH += '<strong>🏠 固定Wi-Fiが検出されました。</strong><br>';
+    noteH += '固定APの場合、電波の急変動は干渉・遮蔽物・混雑が主因です。<br>';
+    if (drops.length > 0)
+      noteH += `⚠️ <strong>${drops.length}回</strong>の急変動を検出。同一チャネルの混雑や一時的な障害物が原因の可能性があります。<br>`;
+    if (stabilityScore < 40)
+      noteH += '🔴 電波安定度が低いため、APの設置場所やチャネル変更の検討を推奨します。<br>';
+    noteH += '💡 AP⇔PC間に遮蔽物がないか、チャネル混雑がないか確認してください。';
+  }
+  noteH += '</div>';
+  document.getElementById('mobNote').innerHTML = noteH;
 }
 
 // ---- Render ----
@@ -475,15 +1736,33 @@ function render() {
   document.getElementById('statsArea').style.display = 'grid';
   document.getElementById('filterBar').style.display = 'flex';
   document.getElementById('headerStatus').textContent = `${allEntries.length} 件のログ`;
+
+  // Show dock trigger with count
+  const trigger = document.getElementById('dockTrigger');
+  trigger.style.display = 'flex';
+  document.getElementById('logCountBadge').textContent = allEntries.length + ' 件';
+  document.getElementById('dockCount').textContent = `(${filtered.length} / ${allEntries.length} 件)`;
+
   document.getElementById('statsArea').innerHTML = `
-    <div class="stat-card"><div class="label">切断回数</div><div class="value red">${disc}</div></div>
-    <div class="stat-card"><div class="label">再接続回数</div><div class="value green">${rec}</div></div>
-    ${roamAll > 0 ? `<div class="stat-card"><div class="label">ローミング回数</div><div class="value yellow">${roamAll}<span style="font-size:11px;color:var(--text-dim);margin-left:6px">うち切断経由 ${roamViaDisc}</span></div></div>` : ''}
-    ${latestBss !== null ? `<div class="stat-card"><div class="label">エリア接続台数（最新）</div><div class="value" style="color:#58a6ff">${latestBss} 台</div></div>` : ''}
-    <div class="stat-card"><div class="label">ステータス記録</div><div class="value">${stat}</div></div>
-    ${avgSig !== null ? `<div class="stat-card"><div class="label">平均電波強度</div><div class="value ${avgSig<40?'red':avgSig<60?'yellow':'green'}">${avgSig}%</div></div>` : ''}
-    ${speed > 0 ? `<div class="stat-card"><div class="label">Speedtest計測回数</div><div class="value">${speed}</div></div>` : ''}
-    ${avgDl !== null ? `<div class="stat-card"><div class="label">平均ダウンロード</div><div class="value yellow">${avgDl} Mbps</div></div>` : ''}
+    <div class="stat-card"><div class="label">切断回数 ${hint('disconnection')}</div><div class="value red">${disc}</div></div>
+    <div class="stat-card"><div class="label">再接続回数 ${hint('reconnection')}</div><div class="value green">${rec}</div></div>
+    ${roamAll > 0 ? `<div class="stat-card"><div class="label">ローミング回数 ${hint('roaming')}</div><div class="value yellow">${roamAll}<span style="font-size:11px;color:var(--text-dim);margin-left:6px">うち切断経由 ${roamViaDisc}</span></div></div>` : ''}
+    ${latestBss !== null ? `<div class="stat-card"><div class="label">エリア接続台数（最新） ${hint('area_devices')}</div><div class="value" style="color:#58a6ff">${latestBss} 台</div></div>` : ''}
+    <div class="stat-card"><div class="label">ステータス記録 ${hint('status_count')}</div><div class="value">${stat}</div></div>
+    ${avgSig !== null ? `<div class="stat-card"><div class="label">平均電波強度 ${hint('avg_signal')}</div><div class="value ${avgSig<40?'red':avgSig<60?'yellow':'green'}">${avgSig}%</div></div>` : ''}
+    ${speed > 0 ? `<div class="stat-card"><div class="label">Speedtest計測回数 ${hint('speedtest_count')}</div><div class="value">${speed}</div></div>` : ''}
+    ${avgDl !== null ? `<div class="stat-card"><div class="label">平均ダウンロード ${hint('avg_download')}</div><div class="value yellow">${avgDl} Mbps</div></div>` : ''}
+    ${(() => {
+      const qEntries = allEntries.filter(e => e.type === 'STATUS' && e.quality?.overall_score != null);
+      if (!qEntries.length) return '';
+      const avgQ = Math.round(qEntries.reduce((a,e) => a + e.quality.overall_score, 0) / qEntries.length);
+      const qColor = avgQ >= 70 ? 'green' : avgQ >= 40 ? 'yellow' : 'red';
+      const bnCounts = {};
+      qEntries.forEach(e => { if (e.quality.bottleneck) bnCounts[e.quality.bottleneck] = (bnCounts[e.quality.bottleneck]||0)+1; });
+      const topBn = Object.entries(bnCounts).sort((a,b)=>b[1]-a[1])[0];
+      const bnStr = topBn ? `<span style="font-size:11px;color:var(--muted);display:block;margin-top:4px">${LAYER_NAMES[topBn[0]]||topBn[0]}: ${topBn[1]}回</span>` : '';
+      return `<div class="stat-card"><div class="label">平均接続品質 ${hint('avg_quality')}</div><div class="value ${qColor}">${avgQ}%${bnStr}</div></div>`;
+    })()}
   `;
 
   const tl = document.getElementById('timeline');
@@ -491,7 +1770,17 @@ function render() {
 
   tl.innerHTML = [...filtered].reverse().map((e, i) => entryHTML(e, i)).join('');
   tl.querySelectorAll('.entry-header').forEach(h => {
-    h.addEventListener('click', () => h.closest('.entry').classList.toggle('open'));
+    h.addEventListener('click', () => {
+      h.closest('.entry').classList.toggle('open');
+    });
+  });
+
+  // Log→Chart: double-click entry to highlight chart point
+  tl.querySelectorAll('.entry').forEach(el => {
+    el.addEventListener('dblclick', () => {
+      const ts = el.dataset.ts;
+      if (ts && mainChart) highlightChartPoint(ts);
+    });
   });
 }
 
@@ -501,16 +1790,93 @@ function signalColor(s) {
   return '#f85149';
 }
 
+function qualityColor(score) {
+  if (score == null) return 'var(--muted)';
+  if (score >= 70) return '#3fb950';
+  if (score >= 40) return '#d29922';
+  return '#f85149';
+}
+
+function qualityIcon(status) {
+  return { good: '✅', warning: '⚠️', poor: '❌', skip: '─' }[status] || '─';
+}
+
+function qualityLabel(status) {
+  return { good: '良好', warning: 'やや不安定', poor: '不安定' }[status] || '---';
+}
+
+const LAYER_NAMES = { wifi: 'Wi-Fi電波', router: 'ルーター', internet: 'ネット回線', dns: 'DNS解決', speed: '実効速度' };
+const LAYER_ICONS = { wifi: '①', router: '②', internet: '③', dns: '④', speed: '⑤' };
+
+function qualityHTML(quality) {
+  if (!quality || !quality.layers) return '';
+  const ly = quality.layers;
+  const overall = quality.overall || 'unknown';
+  const bn = quality.bottleneck;
+  const bnName = bn ? LAYER_NAMES[bn] || bn : null;
+  const overallColor = qualityColor(quality.overall_score);
+
+  let html = `<div class="section-title">接続品質診断 ${hint('avg_quality')}</div>
+    <div class="quality-overall">
+      <span class="q-icon">${qualityIcon(overall)}</span>
+      <span class="q-label" style="color:${overallColor}">${qualityLabel(overall)}</span>
+      ${bnName ? `<span class="q-bn">ボトルネック ${hint('bottleneck')}: ${bnName}</span>` : '<span class="q-bn">ボトルネックなし</span>'}
+    </div>
+    <div class="quality-grid">`;
+
+  for (const [key, name] of Object.entries(LAYER_NAMES)) {
+    const l = ly[key] || {};
+    const score = l.score;
+    const color = qualityColor(score);
+    const pct = score != null ? score + '%' : '---';
+    const isBn = key === bn;
+    let detail = '';
+    if (key === 'wifi') {
+      const parts = [];
+      if (l.rssi != null) parts.push(l.rssi + 'dBm');
+      if (l.snr != null) parts.push('SNR' + l.snr + 'dB');
+      if (l.ch_util != null) parts.push('Ch混雑' + l.ch_util + '%');
+      detail = parts.join(' / ');
+    } else if (key === 'router') {
+      if (l.status === 'skip') {
+        detail = l.note || 'GW ICMP無応答（通信は正常）';
+      } else {
+        const parts = [];
+        if (l.ping_ms != null) parts.push(l.ping_ms + 'ms');
+        if (l.loss_pct != null) parts.push('ロス' + l.loss_pct + '%');
+        detail = parts.join(' / ');
+      }
+    } else if (key === 'internet') {
+      detail = l.resolve_ms != null ? l.resolve_ms + 'ms' : '---';
+    } else if (key === 'speed') {
+      if (l.dl_mbps != null) detail = 'DL' + l.dl_mbps + ' / UL' + (l.ul_mbps||'---') + 'Mbps';
+      else detail = '計測待ち';
+    }
+    html += `
+      <span class="quality-layer-name" style="${isBn?'color:'+color+';font-weight:600':''}">${LAYER_ICONS[key]} ${name} ${hint(key, 'left')}${isBn?' ★':''}</span>
+      <div class="quality-bar-wrap">
+        <div class="quality-bar-fill" style="width:${score??0}%;background:${color}"></div>
+      </div>
+      <span class="quality-pct" style="color:${color}">${pct}</span>
+      <span class="quality-detail">${detail}</span>`;
+  }
+  html += '</div>';
+  if (quality.message && bn) {
+    html += `<div class="quality-message">💡 ${quality.message}</div>`;
+  }
+  return html;
+}
+
 function bssScanHTML(bss, label) {
   if (!bss || !bss.ssids) return '';
   const cachedNote = bss.cached
     ? ' <span style="color:#d29922;font-size:11px">⚠ キャッシュ使用（スキャン不完全）</span>' : '';
   const tsNote = bss.timestamp
     ? ` <span style="color:var(--text-dim);font-size:11px">${bss.timestamp.replace('T',' ').slice(0,16)} 取得</span>` : '';
-  let html = `<div class="section-title">BSSスキャン結果（${label}）— エリア全体 ${bss.total_stations} 台${cachedNote}${tsNote}</div>
+  let html = `<div class="section-title">BSSスキャン結果 ${hint('bss_scan')}（${label}）— エリア全体 ${bss.total_stations} 台${cachedNote}${tsNote}</div>
     <p style="font-size:11px;color:var(--text-dim);margin-bottom:6px">※ BSS台数=APが把握する実接続数 | ARP台数=自PC経由の推定値（別物）</p>
     <table>
-      <tr><th>BSSID</th><th>帯域</th><th>Ch</th><th>接続台数</th><th>電波強度</th><th>Ch使用率</th></tr>`;
+      <tr><th>BSSID</th><th>帯域</th><th>Ch</th><th>接続台数</th><th>電波強度</th><th>Ch使用率 ${hint('ch_util')}</th></tr>`;
   for (const s of bss.ssids) {
     const sname = s.ssid ? s.ssid : `（名称なし / ${s.auth || '---'}）`;
     html += `<tr class="bss-ssid-row"><td colspan="6">${sname} <span style="font-size:11px;font-weight:400;color:var(--text-dim)">合計 ${s.total} 台</span></td></tr>`;
@@ -598,12 +1964,17 @@ function entryHTML(e, i) {
     const lossIcon = loss === 0 ? '✅' : loss < 50 ? '⚠️' : '❌';
     const lossColor = loss === 0 ? 'var(--green)' : loss < 50 ? 'var(--yellow)' : 'var(--red)';
     const avgStr = pl.avg_ms != null ? `${pl.avg_ms} ms` : '---';
-    body += `<div class="section-title">パケットロス（GW宛 定期計測）</div>
+    body += `<div class="section-title">パケットロス ${hint('packet_loss')}（GW宛 定期計測）</div>
       <table>
         <tr><th>項目</th><th>値</th></tr>
         <tr><td>ロス率</td><td style="color:${lossColor}">${lossIcon} ${loss}%</td></tr>
         <tr><td>平均遅延</td><td>${avgStr}</td></tr>
       </table>`;
+  }
+
+  // 接続品質診断（STATUSのみ）
+  if (type === 'status' && e.quality) {
+    body += qualityHTML(e.quality);
   }
 
   if (e.possible_causes?.length) {
@@ -621,7 +1992,7 @@ function entryHTML(e, i) {
       <td>${p.avg_ms != null ? p.avg_ms+'ms' : '---'}</td>
       <td style="color:${p.loss_pct>0?'var(--red)':'var(--green)'}">${p.loss_pct}%</td>
     </tr>`).join('');
-    body += `<div class="section-title">Ping 診断</div>
+    body += `<div class="section-title">Ping 診断 ${hint('ping')}</div>
       <table><tr><th>ホスト</th><th>到達</th><th>平均遅延</th><th>ロス率</th></tr>${rows}</table>`;
   }
   if (e.nearby_aps?.length) {
@@ -647,7 +2018,7 @@ function entryHTML(e, i) {
   // ローミング
   if (type === 'roaming') {
     const via = e.roaming_via === 'disconnect' ? '⚠ 切断経由（一時的に切断が発生）' : '✅ シームレス（切断なし）';
-    body += `<div class="section-title">ローミング情報</div>
+    body += `<div class="section-title">ローミング情報 ${hint('roaming')}</div>
       <table>
         <tr><th>項目</th><th>切替前</th><th>切替後</th></tr>
         <tr><td>BSSID</td>
@@ -710,7 +2081,7 @@ function entryHTML(e, i) {
   }
 
   return `
-  <div class="entry ${type}" id="entry-${i}">
+  <div class="entry ${type}" id="entry-${i}" data-ts="${e.timestamp}">
     <div class="entry-header">
       <span class="entry-time">${ts}</span>
       <span class="badge ${badgeClass}">${icon} ${label}</span>
@@ -720,6 +2091,11 @@ function entryHTML(e, i) {
         ssid
       }</span>
       ${sigBar}
+      ${type==='status' && e.quality ? (() => {
+        const q = e.quality;
+        const qc = q.overall_score >= 70 ? '#1a3a20;color:#3fb950' : q.overall_score >= 40 ? '#3a2e10;color:#d29922' : '#3a1a1a;color:#f85149';
+        return `<span class="quality-badge" style="background:${qc}">${qualityIcon(q.overall)} ${q.overall_score}%</span>`;
+      })() : ''}
       ${body ? '<span class="chevron">▶</span>' : ''}
     </div>
     ${body ? `<div class="entry-body">${body}</div>` : ''}
@@ -734,6 +2110,122 @@ document.getElementById('filterBar').addEventListener('click', e => {
   currentFilter = btn.dataset.filter;
   render();
 });
+
+/* ── Dock panel logic ── */
+function toggleDock(open) {
+  const panel = document.getElementById('dockPanel');
+  const divider = document.getElementById('dockDivider');
+  if (open) {
+    panel.classList.add('open');
+    divider.style.display = 'flex';
+  } else {
+    panel.classList.remove('open');
+    divider.style.display = 'none';
+  }
+}
+
+// Divider drag to resize
+(function initDockResize() {
+  const divider = document.getElementById('dockDivider');
+  const panel = document.getElementById('dockPanel');
+  const dashboard = document.getElementById('dashboard');
+  let startY, startH;
+
+  divider.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    startY = e.clientY;
+    startH = panel.offsetHeight;
+    divider.setPointerCapture(e.pointerId);
+    divider.classList.add('dragging');
+
+    const onMove = ev => {
+      const delta = startY - ev.clientY;
+      const maxH = window.innerHeight - 200; // leave min 200px for dashboard
+      const newH = Math.min(maxH, Math.max(120, startH + delta));
+      panel.style.height = newH + 'px';
+    };
+    const onUp = () => {
+      divider.classList.remove('dragging');
+      divider.removeEventListener('pointermove', onMove);
+      divider.removeEventListener('pointerup', onUp);
+    };
+    divider.addEventListener('pointermove', onMove);
+    divider.addEventListener('pointerup', onUp);
+  });
+
+  // Double-click divider to cycle sizes
+  divider.addEventListener('dblclick', () => {
+    const vh = window.innerHeight;
+    const cur = panel.offsetHeight;
+    if (cur < vh * 0.35) panel.style.height = '45vh';
+    else if (cur < vh * 0.6) panel.style.height = '70vh';
+    else panel.style.height = '260px';
+  });
+
+  // Hide divider initially
+  divider.style.display = 'none';
+})();
+
+/* ── Chart ↔ Log cross-linking ── */
+
+// Store statusEntries reference for chart→log mapping
+let _chartStatusEntries = [];
+
+// Chart→Log: click chart point to scroll to log entry
+function onChartClick(evt, elements) {
+  if (!elements.length) return;
+  const idx = elements[0].index;
+  const entry = _chartStatusEntries[idx];
+  if (!entry) return;
+  scrollToLogEntry(entry.timestamp);
+}
+
+function scrollToLogEntry(timestamp) {
+  const panel = document.getElementById('dockPanel');
+  // Open dock if closed
+  if (!panel.classList.contains('open')) toggleDock(true);
+
+  // Find matching entry
+  const entries = document.querySelectorAll('#timeline .entry');
+  let target = null;
+  let bestDiff = Infinity;
+  const targetTime = new Date(timestamp).getTime();
+  entries.forEach(el => {
+    const ts = el.dataset.ts;
+    if (!ts) return;
+    const diff = Math.abs(new Date(ts).getTime() - targetTime);
+    if (diff < bestDiff) { bestDiff = diff; target = el; }
+  });
+
+  if (!target) return;
+
+  // Remove previous highlights
+  entries.forEach(el => el.classList.remove('highlight'));
+  target.classList.add('highlight');
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+  // Auto-remove highlight after 4s
+  setTimeout(() => target.classList.remove('highlight'), 4000);
+}
+
+// Log→Chart: highlight the nearest chart point
+function highlightChartPoint(timestamp) {
+  if (!mainChart || !_chartStatusEntries.length) return;
+  const targetTime = new Date(timestamp).getTime();
+  let bestIdx = 0, bestDiff = Infinity;
+  _chartStatusEntries.forEach((e, i) => {
+    const diff = Math.abs(new Date(e.timestamp).getTime() - targetTime);
+    if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+  });
+
+  // Show tooltip at that index
+  mainChart.setActiveElements([{ datasetIndex: 0, index: bestIdx }]);
+  mainChart.tooltip.setActiveElements([{ datasetIndex: 0, index: bestIdx }], { x: 0, y: 0 });
+  mainChart.update();
+
+  // Scroll dashboard to show chart
+  document.getElementById('chartCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
 </script>
 </body>
 </html>

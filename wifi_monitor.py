@@ -55,9 +55,9 @@ def _arp_scan_worker(gateway):
         with _arp_scan_lock:
             _arp_scan_result = result
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"\n  🔍 ARPスキャン完了: {result['count']} 台が応答 (ARP台数: {result['arp_count']} 台)  [{ts}]", flush=True)
+        _notify_print(f"  🔍 ARPスキャン完了: {result['count']} 台が応答 (ARP台数: {result['arp_count']} 台)  [{ts}]")
     except Exception as e:
-        print(f"\n  ⚠ ARPスキャン エラー: {e}", flush=True)
+        _notify_print(f"  ⚠ ARPスキャン エラー: {e}")
     finally:
         _arp_scan_running = False
 
@@ -72,8 +72,102 @@ def start_arp_scan(gateway):
     t.start()
 
 
+# ── コンソール出力制御 ───────────────────────────────────────────
+#
+# 根本原因: ステータス行が折り返すと \r は折り返し後の行頭にしか戻れず、
+#           折り返し前の行が残り続ける。
+#
+# 解決策:
+#   1. コンソール幅を動的に取得し、ステータス行をその幅に収まるよう切り詰める
+#   2. _output_lock で全出力を排他制御し、スレッド間の混在を防ぐ
+#   3. 消去は「コンソール幅分のスペース + \r」で行う
+#
+import shutil
+
+_output_lock     = threading.Lock()
+_last_status_len = 0  # 直前に書いたステータス行の表示幅（消去幅の計算用）
+
+
+def _console_width():
+    """現在のコンソール幅を取得する（取得失敗時は80）"""
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:
+        return 80
+
+
+def _display_width(text):
+    """
+    文字列の表示幅を返す（全角文字は2列分・半角は1列分）。
+    unicodedata が使えない環境ではバイト幅で近似する。
+    """
+    try:
+        import unicodedata
+        w = 0
+        for ch in text:
+            eaw = unicodedata.east_asian_width(ch)
+            w += 2 if eaw in ("W", "F") else 1
+        return w
+    except Exception:
+        return len(text.encode("utf-8"))
+
+
+def _fit_to_console(text):
+    """
+    ステータス行をコンソール幅 - 1 文字以内に収まるよう右端を切り詰める。
+    折り返しを防ぐための安全マージンとして末尾1文字分を空けておく。
+    """
+    limit = _console_width() - 1
+    try:
+        import unicodedata
+        w, result = 0, []
+        for ch in text:
+            eaw = unicodedata.east_asian_width(ch)
+            cw  = 2 if eaw in ("W", "F") else 1
+            if w + cw > limit:
+                break
+            result.append(ch)
+            w += cw
+        return "".join(result)
+    except Exception:
+        return text[:limit]
+
+
+def _status_print(text):
+    """ステータスバーを1行で上書き表示する（改行なし・折り返し防止）"""
+    global _last_status_len
+    safe_text = _fit_to_console(text)
+    with _output_lock:
+        width = _console_width()
+        clear = ' ' * max(_last_status_len, width)
+        sys.stdout.write(f"\r{clear}\r{safe_text}")
+        sys.stdout.flush()
+        _last_status_len = _display_width(safe_text)
+
+
+def _notify_print(text):
+    """バックグラウンドスレッドからの通知を出力する（改行あり）"""
+    global _last_status_len
+    with _output_lock:
+        width = _console_width()
+        clear = ' ' * max(_last_status_len, width)
+        sys.stdout.write(f"\r{clear}\r{text}\n")
+        sys.stdout.flush()
+        _last_status_len = 0
+
+
 def _setup_close_handler():
-    """コンソールウィンドウのWM_CLOSEをサブクラス化して×ボタンを制御する"""
+    """
+    コンソールウィンドウの×ボタンに確認ポップアップを割り込ませる。
+
+    改善点：
+    - sys.exit(0) → os._exit(0) に変更
+      subprocess.run() 等のブロッキング処理中でも即座に終了する。
+      os._exit() はPythonの後処理をスキップして OSレベルで即終了するため
+      どのタイミングで×を押しても確実に終了できる。
+    - SetConsoleCtrlHandler でCtrl+C/Ctrl+Breakも同じポップアップを経由させる
+      オプション（コメントアウト済み・必要なら有効化）
+    """
     WM_CLOSE        = 0x0010
     GWL_WNDPROC     = -4
     MB_YESNO        = 0x04
@@ -89,7 +183,6 @@ def _setup_close_handler():
         wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM
     )
 
-    # オリジナルのウィンドウプロシージャを保存
     original = ctypes.windll.user32.GetWindowLongPtrW(hwnd, GWL_WNDPROC)
 
     def custom_wndproc(h, msg, wp, lp):
@@ -101,13 +194,12 @@ def _setup_close_handler():
                 MB_YESNO | MB_ICONQUESTION,
             )
             if result == IDYES:
-                # 元のプロシージャを呼び出して正常終了
-                ctypes.windll.user32.CallWindowProcW(original, h, msg, wp, lp)
-                sys.exit(0)
-            return 0  # 閉じるをキャンセル（0を返すことでWM_CLOSEを無視）
+                # os._exit(0): subprocess等のブロッキング処理中でも即座に強制終了
+                # sys.exit(0) と異なり atexit や finally ブロックを待たない
+                os._exit(0)
+            return 0  # キャンセル → WM_CLOSEを無視して監視継続
         return ctypes.windll.user32.CallWindowProcW(original, h, msg, wp, lp)
 
-    # GC防止のためグローバルに保持
     _setup_close_handler._proc = WNDPROCTYPE(custom_wndproc)
     ctypes.windll.user32.SetWindowLongPtrW(
         hwnd, GWL_WNDPROC, _setup_close_handler._proc
@@ -131,6 +223,49 @@ def run_cmd(cmd, timeout=15):
 
 
 NOISE_FLOOR_DBM = -95  # 推定ノイズフロア（dBm）
+
+SPINNER       = ['｜', '／', '－', '＼']  # 動作確認用スピナーフレーム（全角統一）
+SPINNER_INTERVAL = 0.15               # スピナーの更新間隔（秒）。小さいほど速く回転
+SPINNER_TIMEOUT  = 15                 # メインループの最終更新からこの秒数を超えたら停止表示
+
+# スピナースレッドが書き込む現在のステータス文字列
+_spinner_text      = ""
+_spinner_stop      = threading.Event()
+_spinner_heartbeat = 0.0  # メインループが update_status() を呼んだ最終時刻（time.time()）
+
+
+def _spinner_thread():
+    """ステータス行のスピナー文字だけを定期的に書き直すバックグラウンドスレッド"""
+    idx = 0
+    while not _spinner_stop.is_set():
+        text = _spinner_text
+        if text:
+            elapsed = time.time() - _spinner_heartbeat
+            if elapsed > SPINNER_TIMEOUT:
+                # メインループが止まっている → スピナーを停止マークに固定
+                _status_print("! " + text[2:] + "  [監視停止?]")
+            else:
+                _status_print(SPINNER[idx % len(SPINNER)] + text[1:])
+                idx += 1
+        _spinner_stop.wait(SPINNER_INTERVAL)
+
+
+def start_spinner():
+    """スピナースレッドを起動する（run_monitor の起動時に1回だけ呼ぶ）"""
+    t = threading.Thread(target=_spinner_thread, daemon=True)
+    t.start()
+
+
+def update_status(text):
+    """
+    ステータス行の内容を更新する。呼び出すたびにハートビートを更新する。
+    スピナーは _spinner_thread が自動的に回転させるため、
+    呼び出し側はスピナー文字を気にせず本文だけ渡せばよい。
+    先頭に半角スペースを1文字確保しておくとスピナーが収まる。
+    """
+    global _spinner_text, _spinner_heartbeat
+    _spinner_heartbeat = time.time()
+    _spinner_text = " " + text  # 先頭スペースをスピナーが上書きする
 
 
 def signal_to_rssi(signal_pct):
@@ -436,6 +571,17 @@ def quick_ping_loss(host, count=4):
         return {"loss_pct": 100, "avg_ms": None}
 
 
+def dns_resolve_time(hostname="google.com"):
+    """DNS解決時間を計測する（ms）。失敗時はNone"""
+    import socket
+    try:
+        start = time.time()
+        socket.getaddrinfo(hostname, 80)
+        return round((time.time() - start) * 1000)
+    except Exception:
+        return None
+
+
 _bss_cache = None  # 直前の有効なBSSスキャン結果をキャッシュ
 
 
@@ -539,30 +685,35 @@ def get_nearby_aps():
 
 
 def print_bss_scan(scan, label="定期"):
-    """BSSスキャン結果をコンソールに表示する"""
+    """BSSスキャン結果をボックススタイルでコンソールに表示する"""
+    global _last_status_len
     total      = scan.get("total_stations", 0)
     is_cached  = scan.get("cached", False)
-    cache_note = "  ※ キャッシュ使用（スキャン不完全）" if is_cached else ""
-    print(f"\n  ┌─ BSSスキャン結果（{label}）{cache_note}─────────────────────────")
-    print(f"  │  エリア全体の接続台数: {total} 台")
-    print(f"  │  ※ BSS台数=APが把握する実接続数  ARP台数=自PC経由の推定値")
-    print(f"  │")
+    cache_note = "  ※キャッシュ使用" if is_cached else ""
+    title      = f"BSSスキャン（{label}）{cache_note}"
+    with _output_lock:
+        clear = ' ' * max(_last_status_len, _console_width())
+        sys.stdout.write(f"\r{clear}\r")
+        _last_status_len = 0
+    print()
+    _box_top(title)
+    _line(f"エリア全体の接続台数: {total} 台  ※ BSS台数=APが把握する実接続数")
+    _line()
     for s in scan.get("ssids", []):
-        ssid_label = s["ssid"] if s["ssid"] else f"(名称なし / {s['auth']})"
+        ssid_label      = s["ssid"] if s["ssid"] else f"(名称なし / {s['auth']})"
         all_unsupported = all(b["stations"] is None for b in s.get("bssids", [])) and s.get("bssids")
-        total_str = "BSS Load非対応" if all_unsupported else f"合計 {s['total']} 台"
-        print(f"  │  [{ssid_label}]  {total_str}")
+        total_str       = "BSS Load非対応" if all_unsupported else f"合計 {s['total']} 台"
+        _line(f"[{ssid_label}]  {total_str}")
         for b in s.get("bssids", []):
-            mine  = "★ " if b["is_mine"] else "  "
-            band  = b["band"] or "---"
-            ch    = b["channel"] or "---"
-            sig   = f"{b['signal']}%" if b["signal"] is not None else "---"
-            st    = f"{b['stations']}台" if b["stations"] is not None else "非対応"
-            util  = f"  Ch使用率:{b['ch_util_pct']}%" if b.get("ch_util_pct") is not None else ""
-            mine_label = "  ← 自分が接続中" if b["is_mine"] else ""
-            # 台数が非対応の場合はSSID合計行にも注記
-            print(f"  │  {mine}{b['bssid']}  {band} Ch{ch}  {st}  シグナル:{sig}{util}{mine_label}")
-    print(f"  └──────────────────────────────────────────────────")
+            mine       = "★" if b["is_mine"] else " "
+            band       = b["band"] or "---"
+            ch         = b["channel"] or "---"
+            sig        = f"{b['signal']}%" if b["signal"] is not None else "---"
+            st         = f"{b['stations']}台" if b["stations"] is not None else "非対応"
+            util       = f"  Ch使用率:{b['ch_util_pct']}%" if b.get("ch_util_pct") is not None else ""
+            mine_label = "  ← 接続中" if b["is_mine"] else ""
+            _line(f"  {mine} {b['bssid']}  {band} Ch{ch}  {st}  {sig}{util}{mine_label}")
+    _box_bot()
 
 
 def get_wlan_events(minutes=5):
@@ -591,7 +742,7 @@ def run_speedtest_thread():
     MAX_RETRY = 6  # 最大試行サーバー数
     try:
         import speedtest as st
-        print("\n  📶 Speedtest 計測中（バックグラウンド）...", flush=True)
+        _notify_print("  📶 Speedtest 計測中（バックグラウンド）...")
         s = st.Speedtest()
 
         # 全サーバーをレイテンシ順に取得
@@ -625,7 +776,7 @@ def run_speedtest_thread():
                 last_error = e
                 err_str = str(e)
                 if "403" in err_str or "Forbidden" in err_str:
-                    print(f"\n  ⚠ Speedtest 403 [{sv.get('name','?')}] → 次のサーバーへ ({attempt}/{MAX_RETRY})", flush=True)
+                    _notify_print(f"  ⚠ Speedtest 403 [{sv.get('name','?')}] → 次のサーバーへ ({attempt}/{MAX_RETRY})")
                     continue  # 次のサーバーを試す
                 else:
                     # 403以外（ネットワーク断など）はリトライしない
@@ -645,7 +796,7 @@ def run_speedtest_thread():
         with _speedtest_lock:
             _speedtest_result = result
 
-        print(f"\n  📶 Speedtest 完了 ▼{result['download_mbps']}Mbps ▲{result['upload_mbps']}Mbps Ping:{result['ping_ms']}ms (サーバー: {result['server']})", flush=True)
+        _notify_print(f"  📶 Speedtest 完了 ▼{result['download_mbps']}Mbps ▲{result['upload_mbps']}Mbps Ping:{result['ping_ms']}ms (サーバー: {result['server']})")
 
         save_log({
             "timestamp": result["timestamp"],
@@ -654,11 +805,11 @@ def run_speedtest_thread():
         })
 
     except ImportError:
-        print("\n  ⚠ speedtest-cli が未インストール。'pip install speedtest-cli' を実行してください。", flush=True)
+        _notify_print("  ⚠ speedtest-cli が未インストール。'pip install speedtest-cli' を実行してください。")
         with _speedtest_lock:
             _speedtest_result = {"error": "speedtest-cli not installed"}
     except Exception as e:
-        print(f"\n  ⚠ Speedtest エラー: {e}", flush=True)
+        _notify_print(f"  ⚠ Speedtest エラー: {e}")
         with _speedtest_lock:
             _speedtest_result = {"error": str(e)}
     finally:
@@ -732,18 +883,387 @@ def sep(char="=", width=62):
     print(char * width)
 
 
-def signal_bar(val):
+def signal_bar(val, width=10):
     try:
         n = int(str(val).replace("%", ""))
     except Exception:
         return str(val)
-    filled = round(n / 10)
-    bar = "█" * filled + "░" * (10 - filled)
+    filled = round(n / (100 / width))
+    bar = "█" * filled + "░" * (width - filled)
     return f"{bar} {n}%"
 
 
-def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None, packet_loss=None, arp_scan=None):
-    """詳細ステータスを画面に表示"""
+# ── ボックス描画ヘルパー ──────────────────────────────────────
+
+_BOX_W = 60  # │ で囲んだ内側の文字数（半角基準）
+
+def _box_top(title=""):
+    if title:
+        pad = _BOX_W - len(title) - 3
+        print(f"╔══ {title} {'═' * pad}╗")
+    else:
+        print(f"╔{'═' * (_BOX_W + 2)}╗")
+
+def _box_bot():
+    print(f"╚{'═' * (_BOX_W + 2)}╝")
+
+def _sec(title):
+    pad = _BOX_W - len(title) - 2
+    print(f"╠─ {title} {'─' * pad}╣")
+
+def _row(label, value, lw=10):
+    print(f"║  {label:<{lw}}: {value}")
+
+def _line(text=""):
+    print(f"║  {text}")
+
+
+# ── チャネルマップ描画 ────────────────────────────────────────
+
+def _util_bar(util_pct, width=20):
+    """Ch使用率（0〜100%）を固定幅の棒グラフで表現する"""
+    if util_pct is None:
+        return "─" * width
+    filled = round(min(util_pct, 100) / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _print_channel_map(current_channel, wifi=None):
+    """
+    BSSキャッシュからチャネルごとの接続台数・Ch使用率を集計して表示する。
+    Ch使用率を棒グラフで表示し、チャネルの混雑度を直感的に把握できるようにする。
+    BSSキャッシュにBSSIDデータがない場合（iPhoneテザリング等）は
+    現在のWi-Fi接続情報をフォールバック表示する。
+    """
+    if not _bss_cache:
+        _line("取得待ち（約10分ごとに自動更新）")
+        return
+
+    # チャネルごとにBSSIDエントリを集約
+    ch_map = {}
+    for s in _bss_cache.get("ssids", []):
+        for b in s.get("bssids", []):
+            ch = b.get("channel")
+            if ch is None:
+                continue
+            ch_map.setdefault(ch, []).append({
+                "stations":    b.get("stations"),
+                "ch_util_pct": b.get("ch_util_pct"),
+                "is_mine":     b.get("is_mine", False),
+            })
+
+    if not ch_map:
+        # BSSスキャンにBSSIDデータが無い場合（iPhoneテザリング等）
+        # 現在のWi-Fi接続情報をフォールバック表示する
+        if wifi and wifi.get("channel"):
+            try:
+                ch = int(wifi["channel"])
+            except (ValueError, TypeError):
+                _line("データなし（BSSスキャンにBSSID情報なし）")
+                return
+            sig = wifi.get("signal", "---")
+            ssid = wifi.get("ssid", "---")
+            _line(f"  Ch{ch:>4}★  1AP  {ssid:<12}  電波:{sig}%  ← 接続中")
+            _line()
+            _line("※ BSSスキャンにBSSID詳細なし（テザリング等）")
+            _line("※ 接続中APの情報のみ表示しています")
+            ts_str     = _bss_cache.get("timestamp", "")
+            cache_note = "キャッシュ" if _bss_cache.get("cached") else f"{ts_str[11:16]} 取得"
+            _line(f"（{cache_note}）")
+        else:
+            _line("データなし")
+        return
+
+    try:
+        curr_ch = int(current_channel) if current_channel else None
+    except (ValueError, TypeError):
+        curr_ch = None
+
+    # ヘッダー行
+    _line(f"{'Ch':>6}  {'AP':>3}  {'接続台数':<12}  {'Ch使用率バー':<20}  使用率")
+    _line("─" * 58)
+
+    for ch in sorted(ch_map.keys()):
+        entries   = ch_map[ch]
+        is_curr   = (ch == curr_ch)
+        ap_count  = len(entries)
+
+        # 接続台数
+        known_aps   = [e for e in entries if e["stations"] is not None]
+        unknown_aps = [e for e in entries if e["stations"] is None]
+        known_total = sum(e["stations"] for e in known_aps)
+        if not unknown_aps:
+            st_str = f"{known_total}台"
+        elif known_aps:
+            st_str = f"{known_total}台+不明{len(unknown_aps)}AP"
+        else:
+            st_str = f"不明({ap_count}AP非対応)"
+
+        # Ch使用率バー（同一チャネルの複数APは最大値を代表値とする）
+        utils    = [e["ch_util_pct"] for e in entries if e.get("ch_util_pct") is not None]
+        util_pct = max(utils) if utils else None
+        bar      = _util_bar(util_pct)
+        util_str = f"{util_pct:>3}%" if util_pct is not None else " ---"
+
+        mine_mark = "★" if is_curr else "  "
+        suffix    = "  ← 接続中" if is_curr else ""
+
+        print(f"║  Ch{ch:>4}{mine_mark}  {ap_count}AP  {st_str:<12}  {bar}  {util_str}{suffix}")
+
+    # フッター注記
+    _line()
+    _line("※ Ch使用率バー = 電波帯域の占有率（0%:空き ─ 100%:満杯）")
+    _line("※ 接続台数 = AP が報告する BSS Load（非対応APは不明）")
+    ts_str     = _bss_cache.get("timestamp", "")
+    cache_note = "キャッシュ" if _bss_cache.get("cached") else f"{ts_str[11:16]} 取得"
+    _line(f"（{cache_note}）")
+
+
+# ── 接続品質診断 ──────────────────────────────────────────────
+
+_LAYER_NAMES = {
+    "wifi":     "Wi-Fi電波",
+    "router":   "ルーター",
+    "internet": "ネット回線",
+    "dns":      "DNS解決",
+    "speed":    "実効速度",
+}
+
+_QUALITY_MESSAGES = {
+    "wifi":     "Wi-Fi電波環境に問題があります。ルーターに近づくか、混雑の少ないチャネルへの変更を検討してください",
+    "router":   "ルーター（ゲートウェイ）の応答に問題があります。ルーターの再起動や、接続台数の確認を試してみてください",
+    "internet": "インターネット回線（ISP側）に遅延や損失があります。時間帯による混雑か、ISPの障害の可能性があります",
+    "dns":      "DNS解決に時間がかかっています。DNSサーバーの変更（8.8.8.8 や 1.1.1.1）を検討してください",
+    "speed":    "実効速度が低下しています。回線の混雑や、バックグラウンド通信の影響が考えられます",
+}
+
+
+def _score_status(score):
+    """スコアから状態文字列を返す"""
+    if score is None:
+        return "unknown"
+    if score >= 70:
+        return "good"
+    if score >= 40:
+        return "warning"
+    return "poor"
+
+
+def _score_icon(status):
+    """状態文字列からアイコンを返す"""
+    return {"good": "✅", "warning": "⚠", "poor": "❌", "skip": "─"}.get(status, "─")
+
+
+def diagnose_quality(wifi, packet_loss, internet_ping=None, dns_ms=None):
+    """
+    接続品質を5層で診断する。
+    戻り値: { overall, overall_score, bottleneck, layers: {...}, message }
+    """
+    layers = {}
+
+    # ① Wi-Fi電波
+    wifi_scores = []
+    rssi = wifi.get("rssi_dbm")
+    snr  = wifi.get("snr_db")
+    # BSSキャッシュから自チャネルのCh使用率を取得
+    ch_util = None
+    if _bss_cache:
+        try:
+            my_ch = int(wifi.get("channel", 0))
+        except (ValueError, TypeError):
+            my_ch = None
+        if my_ch:
+            for _s in _bss_cache.get("ssids", []):
+                for _b in _s.get("bssids", []):
+                    if _b.get("channel") == my_ch and _b.get("ch_util_pct") is not None:
+                        ch_util = max(ch_util or 0, _b["ch_util_pct"])
+    if rssi is not None:
+        wifi_scores.append(max(0, min(100, (rssi + 90) * 100 / 40)))
+    if snr is not None:
+        wifi_scores.append(max(0, min(100, snr * 100 / 50)))
+    if ch_util is not None:
+        wifi_scores.append(max(0, 100 - ch_util))
+    wifi_score = round(sum(wifi_scores) / len(wifi_scores)) if wifi_scores else None
+    layers["wifi"] = {
+        "score":   wifi_score,
+        "status":  _score_status(wifi_score),
+        "rssi":    rssi,
+        "snr":     snr,
+        "ch_util": ch_util,
+    }
+
+    # ② ルーター（GW ping）
+    if packet_loss:
+        gw_loss = packet_loss.get("loss_pct", 100)
+        gw_avg  = packet_loss.get("avg_ms")
+        loss_s  = max(0, 100 - gw_loss * 2)
+        lat_s   = max(0, min(100, (100 - (gw_avg or 100)) * 100 / 100)) if gw_avg is not None else 50
+        router_score = round((loss_s * 2 + lat_s) / 3)
+    else:
+        gw_loss, gw_avg, router_score = None, None, None
+    layers["router"] = {
+        "score":    router_score,
+        "status":   _score_status(router_score),
+        "ping_ms":  gw_avg,
+        "loss_pct": gw_loss,
+    }
+
+    # ③ インターネット回線（外部ping）
+    if internet_ping:
+        inet_loss = internet_ping.get("loss_pct", 100)
+        inet_avg  = internet_ping.get("avg_ms")
+        loss_s    = max(0, 100 - inet_loss * 2)
+        lat_s     = max(0, min(100, (200 - (inet_avg or 200)) * 100 / 200)) if inet_avg is not None else 0
+        inet_score = round((loss_s * 2 + lat_s) / 3)
+    else:
+        inet_loss, inet_avg, inet_score = None, None, None
+    layers["internet"] = {
+        "score":    inet_score,
+        "status":   _score_status(inet_score),
+        "ping_ms":  inet_avg,
+        "loss_pct": inet_loss,
+    }
+
+    # ④ DNS解決
+    if dns_ms is not None:
+        dns_score = round(max(0, min(100, (500 - dns_ms) * 100 / 500)))
+    else:
+        dns_score = None
+    layers["dns"] = {
+        "score":      dns_score,
+        "status":     _score_status(dns_score),
+        "resolve_ms": dns_ms,
+    }
+
+    # ⑤ 実効速度（Speedtest）
+    with _speedtest_lock:
+        sp = _speedtest_result
+    if sp and "error" not in sp:
+        dl = sp.get("download_mbps", 0) or 0
+        ul = sp.get("upload_mbps", 0) or 0
+        speed_score = round(max(0, min(100, dl * 100 / 50)))
+    else:
+        dl, ul, speed_score = None, None, None
+    layers["speed"] = {
+        "score":   speed_score,
+        "status":  _score_status(speed_score),
+        "dl_mbps": round(dl, 1) if dl is not None else None,
+        "ul_mbps": round(ul, 1) if ul is not None else None,
+    }
+
+    # GW ICMP無応答の補正:
+    # ルーターが100%ロスでも③④⑤のうち2層以上が良好なら
+    # GWがICMPをブロックしているだけ（テザリング・企業GW等で頻出）
+    router_ly  = layers["router"]
+    if router_ly["score"] is not None and router_ly.get("loss_pct") == 100:
+        other_ok = sum(1 for k in ("internet", "dns", "speed")
+                       if layers[k]["score"] is not None and layers[k]["score"] >= 70)
+        if other_ok >= 2:
+            router_ly["score"]  = None          # スコア対象外
+            router_ly["status"] = "skip"        # ICMP無応答として除外
+            router_ly["note"]   = "GW ICMP無応答（通信は正常）"
+
+    # 総合判定
+    valid_scores = [(k, v["score"]) for k, v in layers.items() if v["score"] is not None]
+    if valid_scores:
+        overall_score = round(sum(s for _, s in valid_scores) / len(valid_scores))
+        min_layer     = min(valid_scores, key=lambda x: x[1])
+        bottleneck    = min_layer[0] if min_layer[1] < 70 else None
+    else:
+        overall_score = None
+        bottleneck    = None
+
+    overall = _score_status(overall_score)
+    message = _QUALITY_MESSAGES.get(bottleneck, "接続品質は良好です ── 問題は検出されていません") if bottleneck else "接続品質は良好です ── 問題は検出されていません"
+
+    return {
+        "overall":       overall,
+        "overall_score": overall_score,
+        "bottleneck":    bottleneck,
+        "layers":        layers,
+        "message":       message,
+    }
+
+
+def _quality_bar(score, width=18):
+    """品質スコア（0〜100）を固定幅の棒グラフで表現する"""
+    if score is None:
+        return "─" * width
+    filled = round(min(score, 100) / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _print_quality_diagnosis(quality):
+    """接続品質診断をボックススタイルで表示する"""
+    if not quality:
+        _line("診断データ取得中...")
+        return
+
+    overall       = quality.get("overall", "unknown")
+    overall_score = quality.get("overall_score")
+    bottleneck    = quality.get("bottleneck")
+    layers        = quality.get("layers", {})
+    message       = quality.get("message", "")
+
+    overall_labels = {"good": "良好", "warning": "やや不安定", "poor": "不安定", "unknown": "---"}
+    icon = _score_icon(overall)
+    bn_str = f" ── ボトルネック: {_LAYER_NAMES.get(bottleneck, '')}" if bottleneck else ""
+    _line(f"総合: {icon} {overall_labels.get(overall, '---')}{bn_str}")
+    _line()
+
+    # 各レイヤー表示
+    layer_order = [("wifi", "① Wi-Fi電波  "), ("router", "② ルーター   "),
+                   ("internet", "③ ネット回線 "), ("dns", "④ DNS解決   "),
+                   ("speed", "⑤ 実効速度  ")]
+
+    for key, label in layer_order:
+        ly = layers.get(key, {})
+        score  = ly.get("score")
+        status = ly.get("status", "unknown")
+        s_icon = _score_icon(status)
+        bar    = _quality_bar(score)
+        pct    = f"{score:>3}%" if score is not None else " ---"
+
+        # レイヤー別の詳細テキスト
+        if key == "wifi":
+            r  = f"{ly.get('rssi','---')}dBm" if ly.get("rssi") is not None else "---"
+            sn = f"SNR{ly.get('snr','---')}dB" if ly.get("snr") is not None else ""
+            cu = f"Ch混雑{ly.get('ch_util','---')}%" if ly.get("ch_util") is not None else ""
+            detail = f"  {r}  {sn}  {cu}".rstrip()
+        elif key == "router":
+            if ly.get("status") == "skip":
+                detail = f"  {ly.get('note', 'GW ICMP無応答')}"
+            else:
+                pm = f"{ly['ping_ms']}ms" if ly.get("ping_ms") is not None else "---"
+                lp = f"ロス{ly.get('loss_pct', '---')}%"
+                detail = f"  {pm} {lp}"
+        elif key == "internet":
+            pm = f"{ly['ping_ms']}ms" if ly.get("ping_ms") is not None else "---"
+            lp = f"ロス{ly.get('loss_pct', '---')}%"
+            detail = f"  {pm} {lp}"
+        elif key == "dns":
+            rm = f"{ly['resolve_ms']}ms" if ly.get("resolve_ms") is not None else "---"
+            detail = f"  解決 {rm}"
+        elif key == "speed":
+            dl = f"DL{ly['dl_mbps']}" if ly.get("dl_mbps") is not None else "DL---"
+            ul = f"UL{ly['ul_mbps']}" if ly.get("ul_mbps") is not None else "UL---"
+            detail = f"  {dl} / {ul}Mbps" if ly.get("dl_mbps") is not None else "  計測待ち"
+        else:
+            detail = ""
+
+        bn_mark = "  ★" if key == bottleneck else ""
+        print(f"║  {label} {s_icon}  {bar}  {pct}{detail}{bn_mark}")
+
+    _line()
+    if message:
+        _line(f"💡 {message}")
+
+
+# ── 詳細ステータス表示 ────────────────────────────────────────
+
+def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None, packet_loss=None, arp_scan=None, quality=None):
+    """詳細ステータスをボックス描画スタイルで表示"""
+    global _last_status_len
     elapsed = datetime.datetime.now() - start_dt
     h, rem  = divmod(int(elapsed.total_seconds()), 3600)
     m, s    = divmod(rem, 60)
@@ -751,83 +1271,98 @@ def print_detail(ts, wifi, gateway, start_dt, detail_count, active_devices=None,
     with _speedtest_lock:
         sp = _speedtest_result
 
+    with _output_lock:
+        # ステータス行を消去してから詳細ブロックを出力
+        clear = ' ' * max(_last_status_len, _console_width())
+        sys.stdout.write(f"\r{clear}\r")
+        _last_status_len = 0
+
     print()
-    sep()
-    print(f"  📡 Wi-Fi 詳細ステータス  [{ts}]")
-    sep("-")
-    print(f"  監視開始    : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  経過時間    : {h:02d}:{m:02d}:{s:02d}")
-    print(f"  ゲートウェイ: {gateway}")
-    # ARPスキャン済みならping応答数も併記
+    _box_top("Wi-Fi 詳細ステータス")
+    _line(f"[{ts}]  経過 {h:02d}:{m:02d}:{s:02d}  監視開始 {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # ── システム ──────────────────────────────────────────────
+    _sec("システム")
+    _row("ゲートウェイ", gateway, lw=12)
+
     if arp_scan:
-        arp_ts   = arp_scan.get("timestamp", "")
-        arp_time = arp_ts[11:16] if arp_ts else "---"
-        dev_str  = f"{active_devices} 台（ARPテーブル）  ping応答: {arp_scan['count']} 台 / {arp_time} 取得"
+        arp_time = (arp_scan.get("timestamp", "") or "")[11:16] or "---"
+        dev_str  = f"{active_devices} 台（ARP）  ping応答: {arp_scan['count']} 台 / {arp_time} 取得"
     else:
-        dev_str = f"{active_devices} 台（ARPテーブル）" if active_devices is not None else "---（ARPスキャン待ち）"
-    print(f"  アクティブ機器: {dev_str}")
-    # BSSキャッシュから接続台数を表示（自分が接続中のBSSIDの台数 + エリア合計）
+        dev_str  = f"{active_devices} 台（ARP）" if active_devices is not None else "--- （ARPスキャン待ち）"
+    _row("アクティブ機器", dev_str, lw=12)
+
     if _bss_cache:
         bss_total = _bss_cache.get("total_stations", 0)
         bss_ts    = _bss_cache.get("timestamp", "")
         bss_time  = bss_ts[11:16] if bss_ts else "---"
-        mine_stations = None
-        current_bssid = wifi.get("bssid", "").lower()
-        for s in _bss_cache.get("ssids", []):
-            for b in s.get("bssids", []):
-                if b.get("bssid") == current_bssid:
-                    mine_stations = b.get("stations")
+        mine_st   = None
+        cur_bssid = wifi.get("bssid", "").lower()
+        for _s in _bss_cache.get("ssids", []):
+            for _b in _s.get("bssids", []):
+                if _b.get("bssid") == cur_bssid:
+                    mine_st = _b.get("stations")
                     break
-        cached_note = "キャッシュ" if _bss_cache.get("cached") else f"{bss_time} 取得"
-        mine_str = f"  自AP:{mine_stations}台" if mine_stations is not None else ""
-        print(f"  BSS接続台数 : {bss_total} 台（エリア合計{mine_str} / {cached_note}）")
+        c_note   = "キャッシュ" if _bss_cache.get("cached") else f"{bss_time} 取得"
+        mine_str = f"  自AP:{mine_st}台" if mine_st is not None else ""
+        _row("BSS 接続台数", f"{bss_total} 台（エリア合計{mine_str} / {c_note}）", lw=12)
     else:
-        print(f"  BSS接続台数 : --- （取得待ち・約10分ごとに自動更新）")
+        _row("BSS 接続台数", "--- （取得待ち・約10分ごとに自動更新）", lw=12)
+
     with _location_lock:
         loc = _location_cache
     if loc:
-        print(f"  現在地      : {loc.get('address', '---')}")
-        print(f"  緯度経度    : {loc.get('lat', '---')}, {loc.get('lon', '---')}")
-        print(f"  Googleマップ: {loc.get('maps_url', '---')}")
-    sep("-")
-    print(f"  SSID        : {wifi.get('ssid', '---')}")
-    print(f"  電波強度    : {signal_bar(wifi.get('signal', '---'))}")
-    print(f"  チャネル    : {wifi.get('channel', '---')} ch")
-    print(f"  周波数帯    : {wifi.get('radio_type', '---')}")
-    print(f"  受信速度(L) : {wifi.get('rx_rate', '---')} Mbps  ← リンク速度")
-    print(f"  送信速度(L) : {wifi.get('tx_rate', '---')} Mbps  ← リンク速度")
-    print(f"  BSSID       : {wifi.get('bssid', '---')}")
-    print(f"  認証方式    : {wifi.get('auth', '---')}")
-    if wifi.get('rssi_dbm') is not None:
-        src = "実測値" if wifi.get("rssi_source") == "wlanapi" else "推定値"
-        snr_src = "実測RSSI基準" if wifi.get("rssi_source") == "wlanapi" else "推定"
-        print(f"  RSSI        : {wifi.get('rssi_dbm')} dBm  ({src})")
-        print(f"  SNR ({snr_src}): {wifi.get('snr_db')} dB")
-    if packet_loss is not None:
-        loss = packet_loss.get("loss_pct", 100)
-        avg  = packet_loss.get("avg_ms")
-        loss_icon = "✅" if loss == 0 else ("⚠" if loss < 50 else "❌")
-        avg_str  = f"  Ping:{avg}ms" if avg is not None else ""
-        print(f"  パケットロス: {loss_icon} {loss}%{avg_str}  (GW宛4回)")
-    sep("-")
+        _row("現在地", loc.get("address", "---"), lw=12)
+        _row("座標", f"{loc.get('lat','---')}, {loc.get('lon','---')}  {loc.get('maps_url','')}", lw=12)
 
-    # Speedtest結果表示
+    # ── Wi-Fi 状態 ────────────────────────────────────────────
+    _sec("Wi-Fi 状態")
+    _row("SSID", wifi.get("ssid", "---"), lw=12)
+    _row("BSSID", wifi.get("bssid", "---"), lw=12)
+    _row("チャネル", f"{wifi.get('channel','---')} ch  {wifi.get('radio_type','---')}", lw=12)
+    _row("電波強度", signal_bar(wifi.get("signal", 0)), lw=12)
+
+    if wifi.get("rssi_dbm") is not None:
+        src     = "実測" if wifi.get("rssi_source") == "wlanapi" else "推定"
+        snr_src = "実測RSSI基準" if wifi.get("rssi_source") == "wlanapi" else "推定"
+        _row("RSSI", f"{wifi['rssi_dbm']} dBm  ({src})  SNR {wifi.get('snr_db','---')} dB  ({snr_src})", lw=12)
+
+    _row("リンク速度", f"Rx {wifi.get('rx_rate','---')} Mbps  /  Tx {wifi.get('tx_rate','---')} Mbps", lw=12)
+    _row("認証方式", wifi.get("auth", "---"), lw=12)
+
+    if packet_loss is not None:
+        loss      = packet_loss.get("loss_pct", 100)
+        avg       = packet_loss.get("avg_ms")
+        loss_icon = "✅" if loss == 0 else ("⚠" if loss < 50 else "❌")
+        avg_str   = f"  Ping: {avg} ms" if avg is not None else ""
+        _row("パケットロス", f"{loss_icon} {loss}%{avg_str}  （GW宛4回）", lw=12)
+
+    # ── チャネルマップ ────────────────────────────────────────
+    _sec("周辺チャネル")
+    _print_channel_map(wifi.get("channel"), wifi=wifi)
+
+    # ── 接続品質診断 ──────────────────────────────────────────
+    _sec("接続品質診断")
+    _print_quality_diagnosis(quality)
+
+    # ── Speedtest ─────────────────────────────────────────────
+    _sec("Speedtest")
     if sp is None:
-        print(f"  Speedtest   : 計測待ち（約{CHECK_INTERVAL * STATUS_LOG_EVERY * SPEEDTEST_EVERY // 60}分ごとに自動計測）")
+        _line(f"計測待ち（約{CHECK_INTERVAL * STATUS_LOG_EVERY * SPEEDTEST_EVERY // 60}分ごとに自動計測）")
     elif "error" in sp:
-        print(f"  Speedtest   : エラー - {sp['error']}")
+        _line(f"エラー: {sp['error']}")
     else:
         st_ts = sp.get("timestamp", "")[:19].replace("T", " ")
-        print(f"  ▼ ダウンロード: {sp.get('download_mbps', '---')} Mbps  （実測値）")
-        print(f"  ▲ アップロード: {sp.get('upload_mbps',   '---')} Mbps  （実測値）")
-        print(f"  🏓 Ping       : {sp.get('ping_ms',        '---')} ms")
-        print(f"  サーバー      : {sp.get('server',          '---')}")
-        print(f"  計測時刻      : {st_ts}")
+        _row("ダウンロード", f"▼ {sp.get('download_mbps','---')} Mbps  （実測値）", lw=12)
+        _row("アップロード", f"▲ {sp.get('upload_mbps','---')} Mbps  （実測値）", lw=12)
+        _row("Ping", f"{sp.get('ping_ms','---')} ms", lw=12)
+        _row("サーバー", f"{sp.get('server','---')}  {st_ts}", lw=12)
 
-    sep("-")
+    # ── フッター ──────────────────────────────────────────────
     next_st_min = (SPEEDTEST_EVERY - (detail_count % SPEEDTEST_EVERY)) * CHECK_INTERVAL * STATUS_LOG_EVERY // 60
-    print(f"  次の詳細更新まで {CHECK_INTERVAL * STATUS_LOG_EVERY} 秒  |  次のSpeedtestまで約{next_st_min}分  |  終了: Ctrl+C")
-    sep()
+    _sec("次のアクション")
+    _line(f"詳細更新: {CHECK_INTERVAL * STATUS_LOG_EVERY} 秒後  |  Speedtest: 約{next_st_min}分後  |  終了: Ctrl+C")
+    _box_bot()
     print()
 
 
@@ -835,18 +1370,18 @@ def run_monitor():
     global _speedtest_result
 
     _setup_close_handler()  # ×ボタン確認ポップアップを有効化
+    start_spinner()          # スピナースレッド起動
 
     start_dt     = datetime.datetime.now()
     detail_count = 0   # 詳細表示の回数カウント
 
-    sep()
-    print("  Wi-Fi 接続監視システム  起動完了")
-    print(f"  監視開始   : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  ログ保存先 : {LOG_DIR}")
-    print(f"  監視間隔   : {CHECK_INTERVAL} 秒")
-    print(f"  Speedtest  : 約{CHECK_INTERVAL * STATUS_LOG_EVERY * SPEEDTEST_EVERY // 60}分ごとに自動計測")
-    print("  終了するには Ctrl + C を押してください")
-    sep()
+    _box_top("Wi-Fi 接続監視システム")
+    _line(f"監視開始   : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    _line(f"ログ保存先 : {LOG_DIR}")
+    _line(f"監視間隔   : {CHECK_INTERVAL} 秒  |  詳細表示: {CHECK_INTERVAL * STATUS_LOG_EVERY} 秒ごと")
+    _line(f"Speedtest  : 約{CHECK_INTERVAL * STATUS_LOG_EVERY * SPEEDTEST_EVERY // 60}分ごとに自動計測")
+    _line("終了: Ctrl+C  または  ×ボタン（確認ポップアップあり）")
+    _box_bot()
 
     # speedtest-cli のインストール確認
     try:
@@ -926,7 +1461,8 @@ def run_monitor():
                 ssid = wifi.get("ssid", "---")
                 ch   = wifi.get("channel", "---")
                 rx   = wifi.get("rx_rate", "---")
-                print(f"\r[{ts}] ✅ 接続中 | {ssid} | 電波:{sig}% | Ch:{ch} | Rx:{rx}Mbps   ", end="", flush=True)
+                rssi_str = f" {wifi.get('rssi_dbm','---')}dBm" if wifi.get('rssi_dbm') is not None else ""
+                update_status(f"[{ts}] 接続中 {ssid} Ch:{ch} 電波:{sig}%{rssi_str} #{loop_count}")
 
                 # 定期詳細表示＆ログ保存
                 if loop_count % STATUS_LOG_EVERY == 0:
@@ -938,8 +1474,13 @@ def run_monitor():
                     active_devices = arp_scan["arp_count"] if arp_scan else get_active_devices()
                     # パケットロス定期計測（ゲートウェイへ4回ping）
                     pkt = quick_ping_loss(gateway, count=4)
+                    # 接続品質診断（外部ping + DNS解決時間）
+                    inet_ping = quick_ping_loss("8.8.8.8", count=2)
+                    dns_ms    = dns_resolve_time()
+                    quality   = diagnose_quality(wifi, pkt, inet_ping, dns_ms)
                     print_detail(ts, wifi, gateway, start_dt, detail_count,
-                                 active_devices, packet_loss=pkt, arp_scan=arp_scan)
+                                 active_devices, packet_loss=pkt, arp_scan=arp_scan,
+                                 quality=quality)
                     with _location_lock:
                         loc = _location_cache
                     save_log({
@@ -950,6 +1491,7 @@ def run_monitor():
                         "active_devices": active_devices,
                         "arp_scan":       arp_scan,
                         "packet_loss":    pkt,
+                        "quality":        quality,
                         "location":       loc,
                     })
 
@@ -1105,7 +1647,7 @@ def run_monitor():
                     })
 
                 else:
-                    print(f"\r[{ts}] ❌ 未接続（接続待機中...）", end="", flush=True)
+                    update_status(f"[{ts}] 未接続（待機中） #{loop_count}")
 
                 bssid_at_disconnect = prev_wifi.get("bssid", "").lower()
                 was_connected = False
